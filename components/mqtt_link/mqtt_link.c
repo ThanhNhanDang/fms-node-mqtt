@@ -18,6 +18,21 @@
 #include "mqtt_link.h"
 #include "net_mgr.h"
 
+/* Tat trong menuconfig thi ca file thanh mot bo stub.
+ *
+ * Phai bao het ca file chu khong chi rieng mqtt_link_start(): cac lua chon
+ * Kconfig khac deu `depends on MQTT_LINK_ENABLE`, nen khi tat chung KHONG
+ * ton tai — moi cho tham chieu CONFIG_MQTT_LINK_BROKER_URI hay
+ * CONFIG_MQTT_LINK_BATCH_MAX se lam vo build. */
+#if !CONFIG_MQTT_LINK_ENABLE
+
+esp_err_t mqtt_link_start(void)     { return ESP_OK; }
+uint32_t  mqtt_link_published(void) { return 0; }
+uint32_t  mqtt_link_dropped(void)   { return 0; }
+bool      mqtt_link_connected(void) { return false; }
+
+#else
+
 #define TAP_QUEUE_LEN 256
 #define TOPIC_MAX     160
 
@@ -224,10 +239,6 @@ static void link_task(void *arg)
 
 esp_err_t mqtt_link_start(void)
 {
-#if !CONFIG_MQTT_LINK_ENABLE
-    ESP_LOGI(TAG, "tat trong cau hinh, bo qua");
-    return ESP_OK;
-#else
     if (CONFIG_MQTT_LINK_BROKER_URI[0] == '\0') {
         ESP_LOGW(TAG, "chua dat broker URI, bo qua (node van chay HTTP)");
         return ESP_OK;
@@ -258,7 +269,6 @@ esp_err_t mqtt_link_start(void)
     }
     ESP_LOGI(TAG, "phat len %s", s_topic_meas);
     return ESP_OK;
-#endif
 }
 
 uint32_t mqtt_link_published(void)
@@ -275,3 +285,5 @@ bool mqtt_link_connected(void)
 {
     return s_connected;
 }
+
+#endif /* CONFIG_MQTT_LINK_ENABLE */
