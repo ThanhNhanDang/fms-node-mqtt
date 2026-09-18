@@ -29,9 +29,10 @@ MQTT không làm gói tin đi nhanh hơn. Nó giải quyết ba thứ khác:
 ## Trong repo có gì
 
 ```
-components/mqtt_link/      component mới, tự chứa
-integration/*.patch        2 bản vá nhỏ vào file có sẵn
+components/mqtt_link/      component mới cho node, tự chứa
+integration/*.patch        2 bản vá nhỏ vào firmware
 broker/                    RabbitMQ chạy tại nhà máy (docker compose)
+edge/                      consumer — bên ĐỌC, cho pcm-edge-collector
 ```
 
 **Không sửa `uplink.c`.** Đường HTTP chạy y nguyên, vẫn là đường chính thức,
@@ -163,7 +164,8 @@ cổng vào.
 | giai đoạn | việc | tình trạng |
 |--|--|--|
 | 1 | dựng broker, chưa ai dùng | ✅ xong, đã kiểm MQTT → AMQP |
-| 2 | node phát song song | 📦 **repo này** — chưa nạp lên node |
+| 2 | node phát song song | ✅ đã nạp, node đang phát thật |
+| 2b | consumer đọc (chế độ bóng) | ✅ đo được 2402 bản ghi/60 s, 0 gói hỏng |
 | 3 | cắt đường lệnh sang MQTT | ⏳ |
 | 4 | Last Will thay heartbeat | ⏳ |
 | 5 | cấu hình retained, bỏ `node_api` | ⏳ |
