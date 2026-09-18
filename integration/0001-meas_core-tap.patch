@@ -1,0 +1,65 @@
+--- a/components/meas_core/meas_core.h
++++ b/components/meas_core/meas_core.h
+@@ -54,6 +54,16 @@
+  * for the live BLE feed. */
+ bool meas_latest(uint16_t channel_id, measurement_t *out);
+ 
++/* Tap: quan sat vien cua MOI so do, goi ngay trong meas_push sau khi seq
++ * va ts da duoc gan. Chay tren task do nen ham callback PHAI khong chan —
++ * day mot hang doi rieng roi tra ve ngay.
++ *
++ * Co mat de mqtt_link phat song song voi uplink ma khong phai tranh
++ * spooler: hai duong doc cung mot nguon, khong dung vao trang thai cua
++ * nhau. Toi da MEAS_MAX_TAP quan sat vien. */
++typedef void (*meas_tap_t)(const measurement_t *m);
++esp_err_t meas_add_tap(meas_tap_t cb);
++
+ /* Consumed by the spooler drain task only. */
+ QueueHandle_t meas_queue(void);
+ 
+--- a/components/meas_core/meas_core.c
++++ b/components/meas_core/meas_core.c
+@@ -9,6 +9,7 @@
+ #define MEAS_QUEUE_LEN   256
+ #define PUSH_TIMEOUT_MS  20
+ #define MEAS_MAX_CHANNEL 16
++#define MEAS_MAX_TAP     2
+ 
+ static const char *TAG = "meas";
+ 
+@@ -22,6 +23,22 @@
+ static bool              s_latest_valid[MEAS_MAX_CHANNEL];
+ static portMUX_TYPE      s_latest_mux = portMUX_INITIALIZER_UNLOCKED;
+ 
++/* dang ky mot lan luc khoi dong, doc tu hot path — khong khoa */
++static meas_tap_t s_taps[MEAS_MAX_TAP];
++static uint8_t    s_tap_n;
++
++esp_err_t meas_add_tap(meas_tap_t cb)
++{
++    if (cb == NULL) {
++        return ESP_ERR_INVALID_ARG;
++    }
++    if (s_tap_n >= MEAS_MAX_TAP) {
++        return ESP_ERR_NO_MEM;
++    }
++    s_taps[s_tap_n++] = cb;
++    return ESP_OK;
++}
++
+ esp_err_t meas_core_init(void)
+ {
+     s_q = xQueueCreate(MEAS_QUEUE_LEN, sizeof(measurement_t));
+@@ -63,6 +80,12 @@
+         taskEXIT_CRITICAL(&s_latest_mux);
+     }
+ 
++    /* Goi tap TRUOC hang doi chinh: quan sat vien thay ca nhung mau bi
++     * rot vi hang day, nen so lieu doi chieu khong bi lech ngam. */
++    for (uint8_t i = 0; i < s_tap_n; i++) {
++        s_taps[i](&m);
++    }
++
+     if (xQueueSend(s_q, &m, pdMS_TO_TICKS(PUSH_TIMEOUT_MS)) != pdTRUE) {
+         __atomic_add_fetch(&s_dropped, 1, __ATOMIC_RELAXED);
+         ESP_LOGW(TAG, "queue full, dropped ch=%u seq=%" PRIu32,

@@ -1,0 +1,55 @@
+menu "FMS: duong MQTT (mqtt_link)"
+
+config MQTT_LINK_ENABLE
+    bool "Bat duong MQTT chay song song voi HTTP"
+    default y
+    help
+      Giai doan 2: phat so do len broker MQTT BEN CANH duong HTTP dang
+      co. Tat di thi node chay y het truoc day.
+
+config MQTT_LINK_BROKER_URI
+    string "Dia chi broker"
+    default ""
+    depends on MQTT_LINK_ENABLE
+    help
+      Vi du: mqtt://192.168.5.190:1883
+      De TRONG thi component khong chay — node van len HTTP binh thuong.
+      Giai doan sau se doi sang mqtts:// kem chung chi.
+
+config MQTT_LINK_USERNAME
+    string "Ten dang nhap broker"
+    default ""
+    depends on MQTT_LINK_ENABLE
+
+config MQTT_LINK_PASSWORD
+    string "Mat khau broker"
+    default ""
+    depends on MQTT_LINK_ENABLE
+    help
+      LUU Y: gia tri nay bi nung vao firmware va nam trong sdkconfig.
+      Chap nhan duoc o giai doan thu nghiem; giai doan 4 se chuyen sang
+      chung danh rieng tung thiet bi nap qua trang /setup cua node.
+
+config MQTT_LINK_TOPIC_BASE
+    string "Goc chu de"
+    default "fms"
+    depends on MQTT_LINK_ENABLE
+    help
+      Chu de day du se la <goc>/<serial>/meas va <goc>/<serial>/status.
+
+config MQTT_LINK_BATCH_MAX
+    int "So ban ghi toi da moi goi"
+    default 50
+    range 1 200
+    depends on MQTT_LINK_ENABLE
+
+config MQTT_LINK_FLUSH_MS
+    int "Thoi gian gom toi da (ms)"
+    default 500
+    range 50 10000
+    depends on MQTT_LINK_ENABLE
+    help
+      Gom du BATCH_MAX ban ghi HOAC het ngan nay thi gui. Nho thi so ve
+      nhanh nhung goi vun hon.
+
+endmenu

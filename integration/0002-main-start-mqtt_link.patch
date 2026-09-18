@@ -1,0 +1,18 @@
+--- a/main/main.c
++++ b/main/main.c
+@@ -30,6 +30,7 @@
+ #include "net_mgr.h"
+ #include "mb_rtu.h"
+ #include "mb_tcp.h"
++#include "mqtt_link.h"
+ #include "scale_serial.h"
+ #include "spooler.h"
+ #include "tower_light.h"
+@@ -66,6 +67,7 @@
+     ESP_ERROR_CHECK(gpio_out_start()); /* relay/lamp outputs, server-commanded */
+     ESP_ERROR_CHECK(scale_serial_start());
+     ESP_ERROR_CHECK(uplink_start());
++    ESP_ERROR_CHECK(mqtt_link_start()); /* phat song song, khong cat HTTP */
+     ESP_ERROR_CHECK(ble_uart_start());   /* live JSON feed for the B4A app */
+     ESP_ERROR_CHECK(ble_central_start()); /* BLE instruments (caliper...) */
+     ESP_ERROR_CHECK(ble_print_init());   /* pool may in BLE (noi thuong truc) */

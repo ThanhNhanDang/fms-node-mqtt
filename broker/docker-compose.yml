@@ -1,0 +1,48 @@
+# Broker cua nha may — GIAI DOAN 1: dung len, chua ai dung.
+#
+# De rieng mot project, KHONG gop vao pcm_edge_server/docker-compose.yml:
+# `docker compose up -d` o project do se recreate edge_collector, ma file
+# .env cua no co nhung bien chi doc luc tao container (xem chinh chu thich
+# trong compose ay). Tach ra thi dung/go broker khong lam gian doan edge.
+#
+# Cong:
+#   1883  MQTT      mo ra LAN  — node ESP32 noi vao day
+#   5672  AMQP      chi 127.0.0.1 — edge_collector cung may tieu thu
+#  15672  quan tri  chi 127.0.0.1 — xem qua SSH tunnel, khong phoi ra LAN
+#
+# TLS va chung danh tung node lam o giai doan sau; giai doan 1 chi can
+# chung minh broker song va nhan duoc thong diep.
+
+services:
+  broker:
+    image: rabbitmq:4-management
+    hostname: pcm-broker          # RabbitMQ lay ten node tu hostname — co
+                                  # dinh de volume du lieu khong bi mo coi
+                                  # moi lan container doi id.
+    environment:
+      - RABBITMQ_DEFAULT_USER=${BROKER_USER}
+      - RABBITMQ_DEFAULT_PASS=${BROKER_PASS}
+      - RABBITMQ_DEFAULT_VHOST=/pcm
+    ports:
+      - "0.0.0.0:1883:1883"
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - ./enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+      - ./rabbitmq.conf:/etc/rabbitmq/conf.d/10-pcm.conf:ro
+      - broker_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g            # may edge co 7,8 GB va con phai nuoi
+                                # edge_collector + mysql; ghim tran lai.
+
+volumes:
+  broker_data:
