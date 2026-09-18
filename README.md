@@ -66,7 +66,13 @@ mở ra đọc là thấy.
 > vòng đệm — HTTP ack trước là MQTT mất bản ghi, và số liệu đối chiếu của
 > giai đoạn 2 thành vô nghĩa.
 
-`0002` gọi `mqtt_link_start()` trong `main.c`, ngay sau `uplink_start()`.
+`0002` gọi `mqtt_link_start()` trong `main.c` ngay sau `uplink_start()`, **và
+thêm `mqtt_link` vào `PRIV_REQUIRES` của `main/CMakeLists.txt`**.
+
+> Thiếu vế thứ hai thì build dừng với
+> `Compilation failed because main.c includes mqtt_link.h … however mqtt_link
+> is not in the requirements list of "main"`. Hệ build của ESP-IDF bắt khai
+> báo phụ thuộc tường minh giữa các component, không tự suy từ `#include`.
 
 ---
 

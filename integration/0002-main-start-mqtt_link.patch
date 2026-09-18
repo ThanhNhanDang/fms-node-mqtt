@@ -16,3 +16,12 @@
      ESP_ERROR_CHECK(ble_uart_start());   /* live JSON feed for the B4A app */
      ESP_ERROR_CHECK(ble_central_start()); /* BLE instruments (caliper...) */
      ESP_ERROR_CHECK(ble_print_init());   /* pool may in BLE (noi thuong truc) */
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -3,5 +3,5 @@
+                        PRIV_REQUIRES nvs_flash esp_timer
+                                      cfg meas_core net_mgr mb_tcp mb_rtu
+                                      i2c_sens io_scan gpio_out scale_serial
+-                                     spooler uplink ble_uart ble_central
++                                     spooler uplink mqtt_link ble_uart ble_central
+                                      ble_print prov_portal tower_light)
