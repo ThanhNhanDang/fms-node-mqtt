@@ -18,19 +18,29 @@ phan tich thu hai, khong co duong ghi thu hai vao outbox, va moi thu phia
 sau (chong mat mau, gom lo, gui lai khi dut mang) dung y nguyen.
 
 
-CHE DO BONG (mac dinh) — doc ky cho nay
----------------------------------------
-O giai doan 2, node gui CUNG MOT so do bang CA HAI duong: HTTP toi
-/node/v1/measurements va MQTT toi day. Neu file nay cung day vao Odoo thi
-Odoo nhan MOI mau HAI LAN — sai du lieu va gap doi tai ghi.
+HAI CHIEU, va tu 19/09 la duong DUY NHAT
+----------------------------------------
+Chieu len   `fms/<serial>/meas`    so do  -> push_node_reading()
+            `fms/<serial>/status`  online/Last Will, va co "cmd"
+Chieu xuong `fms/<serial>/cmd`     lenh   <- manager.queue_command()
+            `fms/<serial>/cmdack`  ket qua -> manager.node_ack_command()
 
-Nen mac dinh no chi DEM, khong day. Dem de doi chieu:
+Node da tat `CONFIG_UPLINK_HTTP_ENABLE`, nen `/node/v1/*` khong con ai goi.
+`EDGE_MQTT_CONSUMER_FORWARD` PHAI la true — de false thi so do chay toi day
+roi dung lai, khong co duong nao khac toi Odoo.
 
-    so mau qua MQTT  ==  so mau qua HTTP   -> duong ong sach, du dieu kien
-                                              cat HTTP o giai doan sau
+Nguoc lai cung dung: dung bat forward khi node van con phat ca hai duong,
+vi khi do Odoo nhan moi mau hai lan.
 
-Bat `EDGE_MQTT_CONSUMER_FORWARD=true` CHI KHI da cat duong HTTP cua node,
-khong bao gio bat luc ca hai dang chay.
+Chon duong cho LENH dua tren co "cmd" node tu khai trong chu de status,
+khong dua tren cau hinh ben nay. Firmware cu khong biet nghe MQTT thi
+khong khai, va manager tu quay ve hang doi poll cho no — mot ham xom co the
+chay lan firmware ma khong phai sua gi o day.
+
+Nhip tim cung do day lo: truoc kia node tu POST /node/v1/heartbeat, cat HTTP
+la mat cai do va thiet bi se chuyen "offline" ben Odoo trong khi so do van
+chay ve deu. _heartbeat_loop() dich trang thai broker sang tieng noi ma Odoo
+dang nghe.
 
 
 Ben bi khi consumer chet
@@ -59,6 +69,13 @@ _logger = logging.getLogger("edge.mqtt_consumer")
 # goi hong/ac y lam nghen vong lap.
 MAX_ITEMS = 1000
 
+# Nhip nhip-tim thay mat node. Xem _heartbeat_loop().
+HEARTBEAT_S = 30
+
+# Coi la dong ho chua dong bo neu truoc moc nay (2020-09). Bang dung nguong
+# EPOCH_SANE_MS cua firmware.
+EPOCH_SANE_S = 1600000000
+
 
 class MqttConsumer:
     """Doc `fms/<serial>/meas` va `fms/<serial>/status` tu broker."""
@@ -77,7 +94,14 @@ class MqttConsumer:
             "last_ts": None,
             "by_serial": {},    # serial -> so ban ghi
             "online": {},       # serial -> True/False theo chu de status
+            "cmd_sent": 0,      # so lenh da day xuong node qua MQTT
+            "cmd_acked": 0,     # so ack lenh nhan lai
+            "ts_dropped": 0,    # so ban ghi co dau thoi gian vo ly
         }
+        # serial -> firmware co biet nhan lenh qua MQTT khong (co "cmd" trong
+        # chu de status). Khong doan: node tu khai.
+        self._caps = {}
+        self._hb_task = None
 
     # -- vong doi ------------------------------------------------------
     async def start(self) -> None:
@@ -98,11 +122,15 @@ class MqttConsumer:
         self._cli.on_disconnect = self._on_disconnect
         self._cli.connect_async(host, port, keepalive=30)
         self._cli.loop_start()
+        self._hb_task = self._loop.create_task(self._heartbeat_loop())
         _logger.info("dang noi broker %s:%s, chu de %s (che do %s)",
                      host, port, settings.mqtt_consumer_topic,
                      "DAY VAO ODOO" if settings.mqtt_consumer_forward else "bong/chi dem")
 
     async def stop(self) -> None:
+        if self._hb_task:
+            self._hb_task.cancel()
+            self._hb_task = None
         if self._cli:
             self._cli.loop_stop()
             self._cli.disconnect()
@@ -116,7 +144,8 @@ class MqttConsumer:
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             client.subscribe([(settings.mqtt_consumer_topic, 1),
-                              (settings.mqtt_consumer_status_topic, 1)])
+                              (settings.mqtt_consumer_status_topic, 1),
+                              (_ack_topic(), 1)])
             self._loop.call_soon_threadsafe(self._set_connected, True)
         else:
             self._loop.call_soon_threadsafe(
@@ -164,9 +193,27 @@ class MqttConsumer:
             return
 
         if kind == "status":
-            self.stats["online"][serial] = bool(data.get("online"))
-            _logger.info("node %s: %s", serial,
-                         "online" if data.get("online") else "OFFLINE (Last Will)")
+            online = bool(data.get("online"))
+            self.stats["online"][serial] = online
+            # Node tu khai co nhan duoc lenh qua MQTT khong. Mat ket noi thi
+            # xoa loi khai di — lenh quay ve hang doi poll thay vi bay vao
+            # hu khong.
+            self._caps[serial] = online and bool(data.get("cmd"))
+            _logger.info("node %s: %s%s", serial,
+                         "online" if online else "OFFLINE (Last Will)",
+                         ", nhan lenh qua MQTT" if self._caps.get(serial) else "")
+            return
+
+        if kind == "cmdack":
+            cmd_id = data.get("id")
+            if not isinstance(cmd_id, int):
+                self.stats["bad"] += 1
+                return
+            self.stats["cmd_acked"] += 1
+            # Dung cho tra loi ma /node/v1/commands/ack van dung: future cua
+            # queue_command dang cho o day, khong co duong thu hai.
+            self._agent.manager.node_ack_command(
+                cmd_id, bool(data.get("ok")), data.get("detail") or "")
             return
 
         items = data.get("items")
@@ -187,6 +234,10 @@ class MqttConsumer:
         if serial not in self.stats["by_serial"]:
             self._subscribe_status(serial)
 
+        # Cho manager biet node nay con song, y het node_api.py lam o duong
+        # HTTP — has_node_or_driver() va /api/command dua vao day.
+        self._agent.manager.touch_node(serial)
+
         n = 0
         for it in items[:MAX_ITEMS]:
             if not isinstance(it, dict):
@@ -197,11 +248,20 @@ class MqttConsumer:
             n += 1
             if not settings.mqtt_consumer_forward:
                 continue
+            # Dau thoi gian vo ly -> bo di, de _on_value lay gio cua edge.
+            #
+            # Truoc day node hoc gio tu HAI nguon: SNTP va tra loi cua
+            # /node/v1/hello. Cat HTTP la mat nguon thu hai, nen mot mang
+            # nha may khong ra duoc pool.ntp.org se lam moi "ts" thanh nam
+            # 1970 — va no chay thang vao Odoo neu khong chan o day.
             ts = it.get("ts")
+            ts_s = (ts / 1000.0) if isinstance(ts, (int, float)) else None
+            if ts_s is not None and ts_s < EPOCH_SANE_S:
+                ts_s = None
+                self.stats["ts_dropped"] += 1
             self._agent.push_node_reading(
                 serial, ch, it.get("v"), it.get("s"), int(it.get("q") or 0),
-                (ts / 1000.0) if isinstance(ts, (int, float)) else None,
-                it.get("stable"),
+                ts_s, it.get("stable"),
             )
             self.stats["forwarded"] += 1
 
@@ -209,6 +269,80 @@ class MqttConsumer:
         self.stats["items"] += n
         self.stats["last_ts"] = time.time()
         self.stats["by_serial"][serial] = self.stats["by_serial"].get(serial, 0) + n
+
+    # -- chieu xuong: day lenh toi node ----------------------------------
+    def publish_command(self, serial: str, payload: dict) -> bool:
+        """Day mot lenh xuong <goc>/<serial>/cmd. Tra False neu khong gui
+        duoc — khi do manager quay ve hang doi poll cua duong HTTP.
+
+        QoS 1, KHONG retain: mot lenh bat den gui luc node mat dien khong
+        duoc phep tu bat len khi no song lai nua tieng sau. Broker vut di
+        lenh gui cho mot node vang mat, dung nhu ta muon."""
+        if not (self._cli and self._connected):
+            return False
+        if not self._caps.get(serial):
+            return False        # node chua khai la nhan duoc lenh qua MQTT
+        topic = _cmd_topic(serial)
+        if topic is None:
+            return False
+        try:
+            info = self._cli.publish(topic, json.dumps(payload), qos=1)
+        except Exception as exc:                                  # noqa: BLE001
+            _logger.warning("khong day duoc lenh toi %s: %s", topic, exc)
+            return False
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            _logger.warning("day lenh toi %s that bai rc=%s", topic, info.rc)
+            return False
+        self.stats["cmd_sent"] += 1
+        return True
+
+    # -- nhip tim thay mat node ------------------------------------------
+    async def _heartbeat_loop(self):
+        """Bao Odoo rang node con song.
+
+        Truoc kia chinh node POST /node/v1/heartbeat moi 30 giay. Cat HTTP
+        la mat cai do, va thiet bi se chuyen sang "offline" ben Odoo trong
+        khi so do van chay ve deu — mot cai den bao noi doi.
+
+        Nguon su that moi la broker: "online" o day den tu chu de status
+        (retained) va tu Last Will, tuc la broker TU bao khi node rot chu
+        khong phai doi het gio mot bo dem. Vong nay chi dich dieu do sang
+        tieng noi ma Odoo dang nghe."""
+        while True:
+            try:
+                await asyncio.sleep(HEARTBEAT_S)
+                if not settings.mqtt_consumer_forward:
+                    continue
+                for serial, online in list(self.stats["online"].items()):
+                    if not online:
+                        continue
+                    await self._agent.forward_node_heartbeat(
+                        serial, {"transport": "mqtt", "buffered": 0})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:                              # noqa: BLE001
+                _logger.warning("nhip tim that bai: %s", exc)
+
+
+def _topic_sibling(last: str):
+    """'fms/+/meas' -> 'fms/+/<last>'. Suy ra tu mau da cau hinh, de khong
+    phai them mot bien .env moi cho tung chu de."""
+    parts = (settings.mqtt_consumer_topic or "").split("/")
+    if len(parts) < 3:
+        return None
+    return "/".join(parts[:-1] + [last])
+
+
+def _ack_topic():
+    return _topic_sibling("cmdack") or "fms/+/cmdack"
+
+
+def _cmd_topic(serial: str):
+    t = _topic_sibling("cmd")
+    if not t:
+        return None
+    t = t.replace("+", serial, 1)
+    return None if ("+" in t or "#" in t) else t
 
 
 def _split_url(url: str):

@@ -47,6 +47,11 @@ uint32_t mqtt_link_suppressed(void);
 
 bool mqtt_link_connected(void);
 
+/* Thuc day tac vu phat ngay thay vi doi het chu ky cho. scale_serial
+ * goi (qua uplink_kick) khi co lan can moi — ban ghi nghiep vu phai di
+ * trong ~1 giay, khong doi nhip nhan roi. An toan o moi noi. */
+void mqtt_link_kick(void);
+
 #ifdef __cplusplus
 }
 #endif

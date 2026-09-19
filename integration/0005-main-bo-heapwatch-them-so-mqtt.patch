@@ -1,0 +1,82 @@
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index 5b8a8c7..1569b94 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -1,6 +1,6 @@
+ idf_component_register(SRCS "main.c"
+                        INCLUDE_DIRS "."
+-                       PRIV_REQUIRES nvs_flash esp_timer heapwatch
++                       PRIV_REQUIRES nvs_flash esp_timer
+                                      cfg meas_core net_mgr mb_tcp mb_rtu
+                                      i2c_sens io_scan gpio_out scale_serial
+                                      spooler uplink mqtt_link ble_uart ble_central
+diff --git a/main/main.c b/main/main.c
+index b7f8a41..f8770eb 100644
+--- a/main/main.c
++++ b/main/main.c
+@@ -22,7 +22,6 @@
+ #include "ble_print.h"
+ #include "ble_uart.h"
+ #include "cfg.h"
+-#include "heapwatch.h"
+ #include "gpio_out.h"
+ #include "i2c_sens.h"
+ #include "io_scan.h"
+@@ -60,30 +59,21 @@ void app_main(void)
+ 
+     ESP_ERROR_CHECK(meas_core_init());
+     ESP_ERROR_CHECK(net_mgr_start());
+-    heap_mark("sau net_mgr_start");
+     ESP_ERROR_CHECK(spooler_init());
+-    heap_mark("sau spooler_init");
+     ESP_ERROR_CHECK(mb_tcp_start());
+-    heap_mark("sau mb_tcp_start");
+     ESP_ERROR_CHECK(mb_rtu_start());  /* onboard RS485: sensors + tower relay */
+-    heap_mark("sau mb_rtu_start");
+     ESP_ERROR_CHECK(i2c_sens_start());
+     ESP_ERROR_CHECK(io_scan_start());
+     ESP_ERROR_CHECK(gpio_out_start()); /* relay/lamp outputs, server-commanded */
+     ESP_ERROR_CHECK(scale_serial_start());
+     ESP_ERROR_CHECK(uplink_start());
+-    heap_mark("sau uplink_start");
+-    ESP_ERROR_CHECK(mqtt_link_start()); /* phat song song, khong cat HTTP */
+-    heap_mark("sau mqtt_link_start");
++    ESP_ERROR_CHECK(mqtt_link_start());
+     ESP_ERROR_CHECK(ble_uart_start());   /* live JSON feed for the B4A app */
+-    heap_mark("sau ble_uart_start");
+     ESP_ERROR_CHECK(ble_central_start()); /* BLE instruments (caliper...) */
+-    heap_mark("sau ble_central_start");
+     ESP_ERROR_CHECK(ble_print_init());   /* pool may in BLE (noi thuong truc) */
+     ESP_ERROR_CHECK(tower_light_start()); /* Qisen tower via relay module */
+     ESP_ERROR_CHECK(prov_button_watch_start()); /* BOOT 5 s -> portal */
+     ESP_ERROR_CHECK(prov_portal_start_runtime()); /* http://<node-ip>/ */
+-    heap_mark("sau prov_portal_start_runtime");
+ 
+     ESP_LOGI(TAG, "fms-node up: serial=%s boot_id=%u fw=0.1.0",
+              cfg_node_serial(), (unsigned)cfg_boot_id());
+@@ -93,14 +83,23 @@ void app_main(void)
+     while (1) {
+         vTaskDelay(pdMS_TO_TICKS(10000));
+         esp_task_wdt_reset();
++        /* `sent` la uplink_sent_total(); khi CONFIG_UPLINK_HTTP_ENABLE tat
++         * thi ham do tra ve chinh mqtt_pub, nen dong nay van doc duoc o ca
++         * hai cau hinh. `mq` la trang thai broker — voi HTTP tat, do la
++         * dieu kien duy nhat de den XANH sang. */
+         ESP_LOGI(TAG,
+                  "status: heap=%" PRIu32 " min_heap=%" PRIu32
+-                 " rssi=%d spool=%u sent=%" PRIu32 " drop=%" PRIu32,
++                 " rssi=%d spool=%u sent=%" PRIu32 " drop=%" PRIu32
++                 " mq=%d pub=%" PRIu32 " mqdrop=%" PRIu32 " rbe=%" PRIu32,
+                  esp_get_free_heap_size(),
+                  esp_get_minimum_free_heap_size(),
+                  net_mgr_rssi(),
+                  (unsigned)spool_depth(),
+                  uplink_sent_total(),
+-                 meas_dropped_count());
++                 meas_dropped_count(),
++                 mqtt_link_connected() ? 1 : 0,
++                 mqtt_link_published(),
++                 mqtt_link_dropped(),
++                 mqtt_link_suppressed());
+     }
+ }

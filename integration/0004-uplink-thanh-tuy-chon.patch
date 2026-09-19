@@ -1,0 +1,107 @@
+diff --git a/components/uplink/CMakeLists.txt b/components/uplink/CMakeLists.txt
+index d938063..9c18d5b 100644
+--- a/components/uplink/CMakeLists.txt
++++ b/components/uplink/CMakeLists.txt
+@@ -1,5 +1,5 @@
+ idf_component_register(SRCS "uplink.c"
+                        INCLUDE_DIRS "."
+-                       PRIV_REQUIRES esp_http_client espressif__cjson cfg meas_core heapwatch
++                       PRIV_REQUIRES esp_http_client espressif__cjson cfg meas_core
+                                      spooler net_mgr esp_timer ble_print mbedtls
+-                                     gpio_out)
++                                     gpio_out mqtt_link)
+diff --git a/components/uplink/uplink.c b/components/uplink/uplink.c
+index 1392353..32073d1 100644
+--- a/components/uplink/uplink.c
++++ b/components/uplink/uplink.c
+@@ -1,3 +1,36 @@
++#include "sdkconfig.h"
++
++#include "uplink.h"
++
++/* Tat CONFIG_UPLINK_HTTP_ENABLE thi ca file nay thanh mot bo stub.
++ *
++ * Phai bao het ca file chu khong chi rieng uplink_start(): moi thu ben
++ * duoi — esp_http_client, bo dem 4 KB, ngan xep 8 KB cua uplink_task —
++ * deu chi ton tai vi duong HTTP. Bao ca file de trinh lien ket vut chung
++ * di that, chu khong chi de chung nam yen.
++ *
++ * Bon ham con lai van phai tra loi dung, vi ben goi khong biet gi ve viec
++ * nay:
++ *   uplink_server_ok()  -> tower_light lay lam den XANH bao suc khoe. Tra
++ *                          false cung deu thi den tat vinh vien, nhin nhu
++ *                          hong. Voi HTTP tat, "con noi duoc voi may chu"
++ *                          nghia la con noi duoc BROKER.
++ *   uplink_sent_total() -> main.c in ra moi 10 giay; lay so cua MQTT.
++ *   uplink_kick()       -> scale_serial goi khi co lan can moi, de ban ghi
++ *                          nghiep vu di ngay thay vi doi het chu ky.
++ */
++#if !CONFIG_UPLINK_HTTP_ENABLE
++
++#include "mqtt_link.h"
++
++esp_err_t uplink_start(void)      { return ESP_OK; }
++uint32_t  uplink_sent_total(void) { return mqtt_link_published(); }
++bool      uplink_server_ok(void)  { return mqtt_link_connected(); }
++void      uplink_kick(void)       { mqtt_link_kick(); }
++void      uplink_set_tower_cb(uplink_tower_cb_t cb) { (void)cb; }
++
++#else
++
+ #include <inttypes.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -17,7 +50,6 @@
+ 
+ #include "ble_print.h"
+ #include "cfg.h"
+-#include "heapwatch.h"
+ #include "gpio_out.h"
+ #include "meas_core.h"
+ #include "net_mgr.h"
+@@ -331,9 +363,7 @@ static bool upload_batch(const measurement_t *batch, size_t n)
+     if (done == 0) {
+         return false;
+     }
+-    heap_mark("truoc POST measurements");
+     int status = http_post_json(PATH_MEASUREMENTS, s_body, true);
+-    heap_mark("sau POST measurements");
+ 
+     /* Ack theo `done`, KHONG theo n: bo dem tinh co the chi chua duoc mot
+      * phan lo. Ack qua ca lo se xoa nhung ban ghi chua he roi khoi node. */
+@@ -396,9 +426,7 @@ static void send_heartbeat(void)
+     char *body = cJSON_PrintUnformatted(root);
+     cJSON_Delete(root);
+     if (body != NULL) {
+-        heap_mark("truoc heartbeat");
+     int status = http_post_json(PATH_HEARTBEAT, body, true);
+-    heap_mark("sau heartbeat");
+         cJSON_free(body);
+         if (status == 200) {
+             s_last_ok_us = esp_timer_get_time();
+@@ -429,9 +457,7 @@ static void send_hello(void)
+     if (body == NULL) {
+         return;
+     }
+-    heap_mark("truoc hello");
+     int status = http_post_json(PATH_HELLO, body, false);
+-    heap_mark("sau hello");
+     cJSON_free(body);
+     if (status != 200) {
+         ESP_LOGI(TAG, "hello status %d", status);
+@@ -821,9 +847,7 @@ static void uplink_task(void *arg)
+          * carries real physical wiring fields end to end. */
+ 
+         if (esp_timer_get_time() >= next_cmd_us) {
+-            heap_mark("truoc poll_command");
+             poll_command();
+-            heap_mark("sau poll_command");
+             next_cmd_us = esp_timer_get_time() + cmd_period_us;
+         }
+ 
+@@ -882,3 +906,5 @@ void uplink_kick(void)
+         xTaskNotifyGive(s_task);
+     }
+ }
++
++#endif /* CONFIG_UPLINK_HTTP_ENABLE */

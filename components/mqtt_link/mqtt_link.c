@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "sdkconfig.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -12,11 +14,7 @@
 #include "esp_timer.h"
 #include "mqtt_client.h"
 
-#include "cfg.h"
-#include "heapwatch.h"
-#include "meas_core.h"
 #include "mqtt_link.h"
-#include "net_mgr.h"
 
 /* Tat trong menuconfig thi ca file thanh mot bo stub.
  *
@@ -31,8 +29,41 @@ uint32_t  mqtt_link_published(void) { return 0; }
 uint32_t  mqtt_link_dropped(void)   { return 0; }
 uint32_t  mqtt_link_suppressed(void){ return 0; }
 bool      mqtt_link_connected(void) { return false; }
+void      mqtt_link_kick(void)      { }
 
 #else
+
+#include "cJSON.h"
+
+#include "cfg.h"
+#include "gpio_out.h"
+#include "meas_core.h"
+#include "net_mgr.h"
+#include "spooler.h"
+
+/* -- HAI CHE DO, mot file ------------------------------------------------
+ *
+ * CHE DO TAP (HTTP con bat) — giai doan do song song. Nguon so do la mot
+ * cai "tap" gan vao meas_core. KHONG doc spooler: spool_peek() chi tra ve
+ * nhung ban ghi cu nhat va uplink moi la ben xoa chung di, hai ben doc
+ * chung mot vong dem thi HTTP ack truoc la MQTT mat ban ghi.
+ *
+ * CHE DO SPOOL (HTTP tat) — MQTT la duong duy nhat. Ly do tranh spooler o
+ * tren bien mat cung voi uplink, va cai gia cua che do tap tro nen khong
+ * chap nhan duoc: tap khong co bo nho, mat broker mot phut la mat that su
+ * mot phut du lieu. Spooler giu 2048 ban ghi.
+ *
+ * Nen o che do spool, mqtt_link tiep quan dung vai tro cu cua uplink:
+ * peek -> publish -> ack khi co PUBACK. Ack theo PUBACK chu khong theo
+ * enqueue: enqueue chi noi "da bo vao hang cua tac vu mang", con outbox
+ * cua esp-mqtt nam trong RAM va mat khi khoi dong lai. Chi PUBACK moi la
+ * loi hua cua broker rang no da nhan.
+ */
+#if CONFIG_UPLINK_HTTP_ENABLE
+#  define SPOOL_MODE 0
+#else
+#  define SPOOL_MODE 1
+#endif
 
 /* 256 ban ghi (5,6 KB) la thua: sau khi co bao-khi-doi nhip chi con ~1/s.
  * 32 van du hap thu mot con bung khi ca day chuyen doi trang thai cung luc. */
@@ -48,25 +79,44 @@ bool      mqtt_link_connected(void) { return false; }
  * uplink.c dung, de hai duong gan nhan thoi gian nhu nhau. */
 #define EPOCH_SANE_MS 1600000000000LL
 
+/* Lenh tu edge: {"id":123,"channel":"relay_blue","cmd":"write","value":1}
+ * — khoang 70 byte. 192 la rong rai; goi dai hon bi bo va ghi nhat ky. */
+#define CMD_JSON_MAX  192
+#define CMD_QUEUE_LEN 4
+
+/* Cho PUBACK bao lau roi coi nhu mat va gui lai lo do. Chi dung o che do
+ * spool. Gui lai co the sinh ban trung, nhung khoa chong trung cua may chu
+ * la (serial, boot_id, seq) nen ban trung bi loai — mat ban ghi thi khong
+ * cuu duoc, con ban trung thi co. */
+#define PUBACK_TIMEOUT_MS 30000
+
 static const char *TAG = "mqttlink";
 
-static QueueHandle_t            s_q;
+static QueueHandle_t            s_q;         /* che do tap */
+static QueueHandle_t            s_cmd_q;
+static TaskHandle_t             s_task;
 static esp_mqtt_client_handle_t s_cli;
 static volatile bool            s_connected;
 static uint32_t                 s_published;
 static uint32_t                 s_dropped;
 static char                     s_topic_meas[TOPIC_MAX];
 static char                     s_topic_status[TOPIC_MAX];
+static char                     s_topic_cmd[TOPIC_MAX];
+static char                     s_topic_cmd_ack[TOPIC_MAX];
 
-/* ── cai tap gan vao meas_core ──────────────────────────────────────────
+#if SPOOL_MODE
+static volatile int  s_inflight = -1;  /* msg_id dang cho PUBACK, -1 = trong */
+static volatile bool s_acked;          /* PUBACK cua s_inflight da toi */
+static int64_t       s_inflight_us;
+static uint16_t      s_ack_bid;
+static uint32_t      s_ack_seq;
+#endif
+
+typedef struct { char json[CMD_JSON_MAX]; } cmd_msg_t;
+
+/* -- bao-khi-doi (report by exception) -----------------------------------
  *
- * Chay TREN TASK DO (mb_tcp, scale_serial, io_scan...), nen tuyet doi
- * khong duoc chan. Hang doi day thi bo va dem — o giai doan nay HTTP van
- * gui du du lieu, mat o day khong mat that.
- */
-/* ── bao-khi-doi (report by exception) ──────────────────────────────────
- *
- * Do ngay tren duong day nay 18/09: count1 · pedal1 · count2 phat so 0 moi
+ * Do ngay tren duong day nay 18/09: count1, pedal1, count2 phat so 0 moi
  * 200 ms va chiem 75% luu luong. Phat lai mot gia tri khong doi khong noi
  * them dieu gi, nhung no chiem song, va chinh loai lang phi do da lam sap
  * instance Odoo sang cung ngay.
@@ -119,6 +169,21 @@ send:
     return true;
 }
 
+/* Quen het, lan sau phat lai tat ca.
+ *
+ * Goi khi mot lo KHONG di duoc. rbe_should_send() da ghi "da phat gia tri
+ * nay" ngay luc quyet dinh, nen neu lo do roi thi nhung ban ghi con nam
+ * trong spooler se bi chinh cai vet do dan xuong o lan thu lai — ban ghi
+ * con nguyen ma khong ai gui. Xoa vet di thi lan sau chung duoc phat lai. */
+static void rbe_reset(void)
+{
+    memset(s_rbe_seen, 0, sizeof(s_rbe_seen));
+}
+
+#if !SPOOL_MODE
+/* Chay TREN TASK DO (mb_tcp, scale_serial, io_scan...), nen tuyet doi
+ * khong duoc chan. Hang doi day thi bo va dem — o che do tap HTTP van gui
+ * du du lieu, mat o day khong mat that. */
 static void tap_cb(const measurement_t *m)
 {
     if (!rbe_should_send(m)) {
@@ -129,8 +194,9 @@ static void tap_cb(const measurement_t *m)
         __atomic_add_fetch(&s_dropped, 1, __ATOMIC_RELAXED);
     }
 }
+#endif
 
-/* ── gom mot lo thanh JSON, KHONG dung cJSON ────────────────────────────
+/* -- gom mot lo thanh JSON, KHONG dung cJSON -----------------------------
  *
  * Ban dau toi bat chuoc build_measurements_body() cua uplink.c: dung cay
  * cJSON roi in ra chuoi. Tren con node nay do la sai lam.
@@ -180,7 +246,7 @@ static size_t build_body(const measurement_t *batch, size_t n, size_t *out_len)
                          m->quality != Q_UNSTABLE ? "true" : "false");
         if (k < 0 || (size_t)k >= sizeof(s_body) - len) {
             break;          /* day bo dem: gui nhung gi da co, phan con lai
-                             * o lai hang doi cho lo sau */
+                             * o lai cho lo sau */
         }
         len += (size_t)k;
         done++;
@@ -196,30 +262,165 @@ static size_t build_body(const measurement_t *batch, size_t n, size_t *out_len)
     return done;
 }
 
+/* -- duong LENH (chieu xuong) --------------------------------------------
+ *
+ * Doi xung voi duong so do: edge phat len <goc>/<serial>/cmd, node tra lai
+ * ket qua o <goc>/<serial>/cmdack. Day la cho lay lai 2,2 giay — truoc kia
+ * node phai DI HOI GET /node/v1/commands moi 2 giay, va do tre trung binh
+ * cua mot lan bam den chinh la nua chu ky do.
+ *
+ * KHONG dung retain va KHONG dung phien ben bi cho chieu nay, co chu dich:
+ * mot lenh bat den gui luc node dang mat dien khong duoc phep tu bat len
+ * khi no song lai nua tieng sau. Lenh la thu cua hien tai. Broker vut di
+ * lenh gui cho mot node vang mat, dung nhu ta muon.
+ *
+ * Chu de ack la "cmdack" chu khong phai "cmd/ack" — mot tang, de ben doc
+ * tach duoc serial ra khoi chu de bang cung mot phep tach nhu meas/status.
+ */
+static void publish_cmd_ack(long id, bool ok, const char *detail)
+{
+    char body[128];
+    int n;
+    if (ok) {
+        n = snprintf(body, sizeof(body), "{\"id\":%ld,\"ok\":true}", id);
+    } else {
+        n = snprintf(body, sizeof(body), "{\"id\":%ld,\"ok\":false,\"detail\":\"%s\"}",
+                     id, detail ? detail : "");
+    }
+    if (n > 0 && (size_t)n < sizeof(body)) {
+        esp_mqtt_client_enqueue(s_cli, s_topic_cmd_ack, body, n, 1, 0, true);
+    }
+}
+
+/* Thuc thi tren link_task chu KHONG tren tac vu su kien cua esp-mqtt:
+ * ngan xep cua no chi 3584 byte va con phai chay ca dong giao thuc. Phan
+ * tich cJSON cong ghi GPIO o do la cach chac chan de tran ngan xep. */
+static void handle_command(const char *json)
+{
+    static long s_last_id = -1;
+
+    cJSON *r = cJSON_Parse(json);
+    if (r == NULL) {
+        ESP_LOGW(TAG, "lenh khong phai JSON hop le");
+        return;
+    }
+    const cJSON *jid = cJSON_GetObjectItemCaseSensitive(r, "id");
+    if (!cJSON_IsNumber(jid)) {
+        cJSON_Delete(r);
+        return;
+    }
+    const long id = (long)jid->valuedouble;
+
+    /* Gui lai cung mot id (QoS 1 cho phep trung) thi ACK lai nhung KHONG
+     * thuc thi lai — bam mot lan khong duoc bien thanh hai lan dao relay. */
+    if (id == s_last_id) {
+        ESP_LOGI(TAG, "lenh %ld da thuc thi roi, chi ack lai", id);
+        publish_cmd_ack(id, true, NULL);
+        cJSON_Delete(r);
+        return;
+    }
+
+    const cJSON *ch    = cJSON_GetObjectItemCaseSensitive(r, "channel");
+    const cJSON *op    = cJSON_GetObjectItemCaseSensitive(r, "cmd");
+    const cJSON *value = cJSON_GetObjectItemCaseSensitive(r, "value");
+    const char *ch_code = cJSON_IsString(ch) ? ch->valuestring : "";
+    const char *op_str  = cJSON_IsString(op) ? op->valuestring : "";
+
+    char detail[64];
+    bool ok = gpio_out_execute_command(
+        ch_code, op_str, cJSON_IsNumber(value),
+        cJSON_IsNumber(value) ? value->valuedouble : 0.0,
+        detail, sizeof(detail));
+    if (ok) {
+        s_last_id = id;
+        ESP_LOGI(TAG, "lenh %ld [%s] tren kenh %s: OK", id, op_str, ch_code);
+    } else {
+        ESP_LOGW(TAG, "lenh %ld [%s] tren kenh %s bi tu choi: %s",
+                 id, op_str, ch_code, detail);
+    }
+    publish_cmd_ack(id, ok, detail);
+    cJSON_Delete(r);
+}
+
+static void drain_commands(void)
+{
+    cmd_msg_t msg;
+    while (s_cmd_q != NULL && xQueueReceive(s_cmd_q, &msg, 0) == pdTRUE) {
+        handle_command(msg.json);
+        esp_task_wdt_reset();
+    }
+}
+
 static void on_mqtt_event(void *handler_args, esp_event_base_t base,
                           int32_t event_id, void *event_data)
 {
     (void)handler_args;
     (void)base;
-    (void)event_data;
+    const esp_mqtt_event_handle_t e = (esp_mqtt_event_handle_t)event_data;
 
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         s_connected = true;
+        /* Dang ky o DAY chu khong o luc khoi tao: moi lan noi lai broker la
+         * mot phien moi, dang ky cu khong con. Dat nham cho nay thi lenh
+         * chay binh thuong toi lan rot mang dau tien roi im vinh vien. */
+        esp_mqtt_client_subscribe(s_cli, s_topic_cmd, 1);
         /* Bao con song, retained: ai dang ky sau van doc duoc trang thai
          * hien tai ma khong phai cho goi ke tiep. Cap voi Last Will o
          * duoi — broker tu phat "online:false" khi node rot, khong ton
          * mot goi heartbeat nao. Day la thu HTTP khong lam duoc. */
+        /* "cmd":true la loi TU GIOI THIEU: firmware nay biet nhan lenh qua
+         * MQTT. Edge doc co nay de quyet dinh gui lenh xuong duong nao —
+         * node cu (chi biet GET /node/v1/commands) khong co co nay nen van
+         * duoc phuc vu bang hang doi poll. Khong phai dat cau hinh o hai
+         * noi roi cho chung lech nhau. */
         esp_mqtt_client_publish(s_cli, s_topic_status,
-                                "{\"online\":true}", 0, 1, 1);
-        ESP_LOGI(TAG, "da noi broker");
-        heap_mark("mqtt CONNECTED");
+                                "{\"online\":true,\"cmd\":true}", 0, 1, 1);
+        ESP_LOGI(TAG, "da noi broker, dang ky %s", s_topic_cmd);
         break;
 
     case MQTT_EVENT_DISCONNECTED:
         s_connected = false;
         ESP_LOGW(TAG, "mat ket noi broker");
         break;
+
+    case MQTT_EVENT_DATA:
+        /* Goi bi cat lam nhieu manh thi bo — lenh chi vai chuc byte, mot
+         * goi lenh dai hon buffer.size (512) la goi hong hoac khong phai
+         * cua ta. Ghep manh o day se phai giu trang thai giua cac lan goi
+         * va khong dang cho mot thu khong bao gio xay ra. */
+        if (e->data_len != e->total_data_len || e->data_len <= 0 ||
+            (size_t)e->data_len >= CMD_JSON_MAX) {
+            break;
+        }
+        if ((size_t)e->topic_len != strlen(s_topic_cmd) ||
+            strncmp(e->topic, s_topic_cmd, (size_t)e->topic_len) != 0) {
+            break;
+        }
+        {
+            cmd_msg_t msg;
+            memcpy(msg.json, e->data, (size_t)e->data_len);
+            msg.json[e->data_len] = '\0';
+            if (s_cmd_q != NULL) {
+                xQueueSend(s_cmd_q, &msg, 0);
+                if (s_task != NULL) {
+                    xTaskNotifyGive(s_task);   /* thuc day de thuc thi ngay */
+                }
+            }
+        }
+        break;
+
+#if SPOOL_MODE
+    case MQTT_EVENT_PUBLISHED:
+        /* PUBACK: broker da nhan. Gio moi duoc xoa khoi spooler. */
+        if (s_inflight >= 0 && e->msg_id == s_inflight) {
+            s_acked = true;
+            if (s_task != NULL) {
+                xTaskNotifyGive(s_task);
+            }
+        }
+        break;
+#endif
 
     case MQTT_EVENT_ERROR:
         ESP_LOGW(TAG, "loi mqtt");
@@ -230,10 +431,159 @@ static void on_mqtt_event(void *handler_args, esp_event_base_t base,
     }
 }
 
+#if !SPOOL_MODE
+/* -- che do tap: gom tu hang doi cua tap roi phat ------------------------ */
+static void pump_tap(measurement_t *batch)
+{
+    /* Gom toi khi day lo HOAC het thoi gian cho — cai nao truoc.
+     * FLUSH_MS nho thi so ve nhanh, nhung goi vun; day la cho chinh
+     * de danh doi giua do tuoi va so luong goi. */
+    size_t     n        = 0;
+    TickType_t deadline = xTaskGetTickCount() +
+                          pdMS_TO_TICKS(CONFIG_MQTT_LINK_FLUSH_MS);
+    while (n < (size_t)CONFIG_MQTT_LINK_BATCH_MAX) {
+        TickType_t now = xTaskGetTickCount();
+        if (now >= deadline) {
+            break;
+        }
+        TickType_t wait = deadline - now;
+        if (wait > pdMS_TO_TICKS(200)) {
+            wait = pdMS_TO_TICKS(200); /* lat nho de con reset wdt */
+        }
+        if (xQueueReceive(s_q, &batch[n], wait) == pdTRUE) {
+            n++;
+        }
+        esp_task_wdt_reset();
+    }
+    esp_task_wdt_reset();
+
+    if (n == 0) {
+        return;
+    }
+    if (!s_connected) {
+        __atomic_add_fetch(&s_dropped, n, __ATOMIC_RELAXED);
+        return;
+    }
+
+    size_t body_len = 0;
+    size_t done = build_body(batch, n, &body_len);
+    if (done == 0) {
+        __atomic_add_fetch(&s_dropped, n, __ATOMIC_RELAXED);
+        return;
+    }
+    /* enqueue, KHONG publish.
+     *
+     * esp_mqtt_client_publish() o QoS 1 CHAN tac vu goi cho toi khi co
+     * PUBACK. enqueue() bo goi vao hang cua tac vu mang roi tra ve ngay;
+     * QoS 1 va PUBACK van nguyen. esp-mqtt CHEP payload vao outbox cua no,
+     * nen dung bo dem tinh o day la an toan. */
+    int msg_id = esp_mqtt_client_enqueue(s_cli, s_topic_meas, s_body,
+                                         (int)body_len, 1, 0, true);
+    if (msg_id < 0) {
+        __atomic_add_fetch(&s_dropped, done, __ATOMIC_RELAXED);
+        ESP_LOGW(TAG, "enqueue that bai, bo %u ban ghi", (unsigned)done);
+    } else {
+        /* Dem `done`, KHONG phai `n`: build_body co the cat lo. Truoc
+         * 19/09 o day cong CA HAI, nen con so nay bao gap doi su that. */
+        __atomic_add_fetch(&s_published, done, __ATOMIC_RELAXED);
+    }
+    if (done < n) {
+        __atomic_add_fetch(&s_dropped, n - done, __ATOMIC_RELAXED);
+    }
+}
+#endif /* !SPOOL_MODE */
+
+#if SPOOL_MODE
+/* -- che do spool: peek -> phat -> ack khi co PUBACK --------------------- */
+static void pump_spool(measurement_t *batch)
+{
+    /* Mot lo bay mot luc. Don gian, va tu no lam luon viec dieu nhip: khi
+     * duong day ban thi lo sau to hon, khi vang thi goi di ngay. */
+    if (s_inflight >= 0) {
+        if (s_acked) {
+            spool_ack_through(s_ack_bid, s_ack_seq);
+            s_inflight = -1;
+            s_acked = false;
+        } else if (esp_timer_get_time() - s_inflight_us >
+                   (int64_t)PUBACK_TIMEOUT_MS * 1000) {
+            ESP_LOGW(TAG, "khong thay PUBACK sau %d ms, gui lai lo",
+                     PUBACK_TIMEOUT_MS);
+            s_inflight = -1;
+            rbe_reset();
+        } else {
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
+            return;
+        }
+    }
+    if (!s_connected) {
+        /* Khong dong vao spooler: ban ghi nam nguyen do cho ket noi lai.
+         * Day chinh la thu che do tap khong co. */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
+        return;
+    }
+
+    size_t n = spool_peek(batch, CONFIG_MQTT_LINK_BATCH_MAX);
+    if (n == 0) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CONFIG_MQTT_LINK_FLUSH_MS));
+        return;
+    }
+
+    /* Bao-khi-doi tren duong spool: loc TAI CHO, giu lai moc cuoi cua ca
+     * lo de con ack — ban ghi bi nen lai van phai bien khoi spooler, neu
+     * khong lo sau se doc lai dung chung va vong nay khong bao gio tien. */
+    const uint16_t tail_bid = batch[n - 1].boot_id;
+    const uint32_t tail_seq = batch[n - 1].seq;
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (rbe_should_send(&batch[i])) {
+            batch[k++] = batch[i];
+        } else {
+            __atomic_add_fetch(&s_suppressed, 1, __ATOMIC_RELAXED);
+        }
+    }
+    if (k == 0) {
+        spool_ack_through(tail_bid, tail_seq);
+        return;
+    }
+
+    size_t body_len = 0;
+    size_t done = build_body(batch, k, &body_len);
+    if (done == 0) {
+        /* Mot ban ghi don khong lot noi bo dem — khong the xay ra voi
+         * BODY_BYTES tu 512 tro len, nhung neu xay ra thi phai nhich len,
+         * khong duoc ket vinh vien o cung mot ban ghi. */
+        ESP_LOGE(TAG, "khong dung noi goi, bo 1 ban ghi (kenh %u)",
+                 (unsigned)batch[0].channel_id);
+        __atomic_add_fetch(&s_dropped, 1, __ATOMIC_RELAXED);
+        spool_ack_through(batch[0].boot_id, batch[0].seq);
+        return;
+    }
+
+    int msg_id = esp_mqtt_client_enqueue(s_cli, s_topic_meas, s_body,
+                                         (int)body_len, 1, 0, true);
+    if (msg_id < 0) {
+        ESP_LOGW(TAG, "enqueue that bai, giu lo lai trong spooler");
+        rbe_reset();
+        vTaskDelay(pdMS_TO_TICKS(200));
+        return;                       /* KHONG ack: lo do van con nguyen */
+    }
+    /* Ack toi dau: neu build_body cat lo thi chi toi ban ghi cuoi da ma
+     * hoa — nhung ban ghi truoc no hoac da ma hoa hoac da bi nen lai, nen
+     * xoa toi do la dung. */
+    s_ack_bid = (done == k) ? tail_bid : batch[done - 1].boot_id;
+    s_ack_seq = (done == k) ? tail_seq : batch[done - 1].seq;
+    s_inflight_us = esp_timer_get_time();
+    s_acked = false;
+    s_inflight = msg_id;
+    __atomic_add_fetch(&s_published, done, __ATOMIC_RELAXED);
+}
+#endif /* SPOOL_MODE */
+
 static void link_task(void *arg)
 {
     (void)arg;
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
+    s_task = xTaskGetCurrentTaskHandle();
 
     /* Cho co IP roi hay mo ket noi. esp-mqtt tu thu lai duoc, nhung cho
      * o day thi nhat ky sach hon va khong ban mot vong thu vo ich luc
@@ -255,9 +605,8 @@ static void link_task(void *arg)
         .session.last_will.retain      = 1,
         .network.reconnect_timeout_ms  = 5000,
         /* Mac dinh cua esp-mqtt la 1024/1024 va ngan xep 6144 — rong rai
-         * cho mot thiet bi thong thuong, qua tay cho con node nay (heap
-         * trong chi 48 KB, xem ghi chu dau ham build_body). Goi ra lon
-         * nhat la s_body; goi vao chi la PUBACK va lenh, vai chuc byte. */
+         * cho mot thiet bi thong thuong, qua tay cho con node nay. Goi ra
+         * lon nhat la s_body; goi vao chi la PUBACK va lenh. */
         .buffer.size                   = 512,
         .buffer.out_size               = CONFIG_MQTT_LINK_BODY_BYTES + 256,
         .task.stack_size               = 3584,
@@ -271,9 +620,7 @@ static void link_task(void *arg)
         return;
     }
     esp_mqtt_client_register_event(s_cli, ESP_EVENT_ANY_ID, on_mqtt_event, NULL);
-    heap_mark("truoc mqtt start");
     esp_mqtt_client_start(s_cli);
-    heap_mark("sau mqtt start");
 
     measurement_t *batch = calloc(CONFIG_MQTT_LINK_BATCH_MAX,
                                   sizeof(measurement_t));
@@ -286,65 +633,24 @@ static void link_task(void *arg)
     }
 
     while (1) {
-        /* Gom toi khi day lo HOAC het thoi gian cho — cai nao truoc.
-         * FLUSH_MS nho thi so ve nhanh, nhung goi vun; day la cho chinh
-         * de danh doi giua do tuoi va so luong goi. */
-        size_t     n        = 0;
-        TickType_t deadline = xTaskGetTickCount() +
-                              pdMS_TO_TICKS(CONFIG_MQTT_LINK_FLUSH_MS);
-        while (n < (size_t)CONFIG_MQTT_LINK_BATCH_MAX) {
-            TickType_t now = xTaskGetTickCount();
-            if (now >= deadline) {
-                break;
-            }
-            TickType_t wait = deadline - now;
-            if (wait > pdMS_TO_TICKS(200)) {
-                wait = pdMS_TO_TICKS(200); /* lat nho de con reset wdt */
-            }
-            if (xQueueReceive(s_q, &batch[n], wait) == pdTRUE) {
-                n++;
-            }
-            esp_task_wdt_reset();
-        }
         esp_task_wdt_reset();
-
-        if (n == 0) {
-            continue;
-        }
-        if (!s_connected) {
-            __atomic_add_fetch(&s_dropped, n, __ATOMIC_RELAXED);
-            continue;
-        }
-
-        size_t body_len = 0;
-        size_t done = build_body(batch, n, &body_len);
-        if (done == 0) {
-            __atomic_add_fetch(&s_dropped, n, __ATOMIC_RELAXED);
-            continue;
-        }
-        /* enqueue, KHONG publish.
-         *
-         * esp_mqtt_client_publish() o QoS 1 CHAN tac vu goi cho toi khi co
-         * PUBACK. enqueue() bo goi vao hang cua tac vu mang roi tra ve
-         * ngay; QoS 1 va PUBACK van nguyen. esp-mqtt CHEP payload vao
-         * outbox cua no, nen dung bo dem tinh o day la an toan. */
-        heap_mark("truoc enqueue");
-        int msg_id = esp_mqtt_client_enqueue(s_cli, s_topic_meas, s_body,
-                                             (int)body_len, 1, 0, true);
-        if (msg_id < 0) {
-            __atomic_add_fetch(&s_dropped, done, __ATOMIC_RELAXED);
-            ESP_LOGW(TAG, "enqueue that bai, bo %u ban ghi", (unsigned)done);
-        } else {
-            __atomic_add_fetch(&s_published, done, __ATOMIC_RELAXED);
-            __atomic_add_fetch(&s_published, n, __ATOMIC_RELAXED);
-        }
+        drain_commands();
+#if SPOOL_MODE
+        pump_spool(batch);
+#else
+        pump_tap(batch);
+#endif
     }
 }
 
 esp_err_t mqtt_link_start(void)
 {
     if (CONFIG_MQTT_LINK_BROKER_URI[0] == '\0') {
+#if SPOOL_MODE
+        ESP_LOGE(TAG, "chua dat broker URI ma HTTP cung tat — node se cam");
+#else
         ESP_LOGW(TAG, "chua dat broker URI, bo qua (node van chay HTTP)");
+#endif
         return ESP_OK;
     }
 
@@ -353,30 +659,46 @@ esp_err_t mqtt_link_start(void)
              CONFIG_MQTT_LINK_TOPIC_BASE, serial);
     snprintf(s_topic_status, sizeof(s_topic_status), "%s/%s/status",
              CONFIG_MQTT_LINK_TOPIC_BASE, serial);
+    snprintf(s_topic_cmd, sizeof(s_topic_cmd), "%s/%s/cmd",
+             CONFIG_MQTT_LINK_TOPIC_BASE, serial);
+    snprintf(s_topic_cmd_ack, sizeof(s_topic_cmd_ack), "%s/%s/cmdack",
+             CONFIG_MQTT_LINK_TOPIC_BASE, serial);
 
+    s_cmd_q = xQueueCreate(CMD_QUEUE_LEN, sizeof(cmd_msg_t));
+    if (s_cmd_q == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+#if !SPOOL_MODE
     s_q = xQueueCreate(TAP_QUEUE_LEN, sizeof(measurement_t));
     if (s_q == NULL) {
         return ESP_ERR_NO_MEM;
     }
-
     esp_err_t err = meas_add_tap(tap_cb);
     if (err != ESP_OK) {
         vQueueDelete(s_q);
         s_q = NULL;
         return err;
     }
+    /* Uu tien 4 — THAP HON uplink (5) va cung loi 0: khi hai ben tranh
+     * song thi duong chinh thuc phai thang. */
+    const UBaseType_t prio = 4;
+#else
+    /* HTTP tat: khong con ai de nhuong. Lay dung uu tien cu cua uplink. */
+    const UBaseType_t prio = 5;
+#endif
 
-    /* Uu tien 4 — THAP HON uplink (5) va cung loi 0. Duong HTTP van la
-     * duong chinh thuc cho toi khi cat han; khi hai ben tranh song thi
-     * uplink phai thang. */
-    /* 3072 du: dung chuoi bang snprintf vao bo dem TINH, khong co cay
-     * cJSON nao tren ngan xep nua. Uu tien 4 — THAP HON uplink (5). */
-    BaseType_t ok = xTaskCreatePinnedToCore(link_task, "mqtt_link", 3072,
-                                            NULL, 4, NULL, 0);
+    /* 4096: so do van viet bang snprintf vao bo dem TINH (khong cay cJSON),
+     * nhung duong LENH co phan tich cJSON chay tren dung task nay. */
+    BaseType_t ok = xTaskCreatePinnedToCore(link_task, "mqtt_link", 4096,
+                                            NULL, prio, NULL, 0);
     if (ok != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "phat len %s", s_topic_meas);
+    ESP_LOGI(TAG, "che do %s; phat %s, nhan lenh %s",
+             SPOOL_MODE ? "SPOOL (MQTT la duong duy nhat)"
+                        : "TAP (chay song song HTTP)",
+             s_topic_meas, s_topic_cmd);
     return ESP_OK;
 }
 
@@ -398,6 +720,13 @@ uint32_t mqtt_link_suppressed(void)
 bool mqtt_link_connected(void)
 {
     return s_connected;
+}
+
+void mqtt_link_kick(void)
+{
+    if (s_task != NULL) {
+        xTaskNotifyGive(s_task);
+    }
 }
 
 #endif /* CONFIG_MQTT_LINK_ENABLE */
