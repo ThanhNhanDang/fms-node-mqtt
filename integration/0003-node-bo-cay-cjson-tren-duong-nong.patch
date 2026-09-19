@@ -1,0 +1,263 @@
+--- a/components/uplink/uplink.c
++++ b/components/uplink/uplink.c
+@@ -41,6 +41,10 @@
+  * node thu lai trong <=30s (khong cho 5 phut nhu remote link). */
+ #define BACKOFF_MAX_MS   30000
+ #define RESP_BUF_SIZE    512
++/* Bo dem TINH dung goi measurements. Mot ban ghi ~110 byte -> 4 KB chua
++ * ~35 ban ghi; day thi cat lo, phan con lai di lo sau. Tinh chu khong
++ * malloc de khong phan manh heap tren duong nong. */
++#define BODY_BYTES       4096
+ #define CFG_JSON_MAX     16384           /* matches cfg.c CHJSON_MAX */
+ #define CFG_RETRY_US     (5LL * 60 * 1000000)  /* min gap between fetches */
+ #define CFG_DRAIN_BATCHES 20             /* spool flush cap before restart */
+@@ -190,58 +194,91 @@
+     return status;
+ }
+ 
+-/* {"items":[{ch,v,s,q,ts,stable}], "bid", "seq"} per node_api.py's
+- * /node/v1/measurements. "s" (string reading) has no ESP32 equivalent (all
+- * channels here are numeric) so it always goes out as null, same as
+- * node_agent's SimReader/SerialReader do when they have no string form.
+- * bid/seq at the outer level are currently decorative on the edge_collector
+- * side (node_hello()/node_measurements() don't dedup on them) but are kept
+- * as the per-boot session id + last record's seq to match the contract
+- * shape and stay meaningful if the edge starts using them. */
+-static char *build_measurements_body(const measurement_t *batch, size_t n)
+-{
+-    cJSON *root = cJSON_CreateObject();
+-    cJSON_AddNumberToObject(root, "bid", batch[n - 1].boot_id);
+-    cJSON_AddNumberToObject(root, "seq", batch[n - 1].seq);
+-    cJSON *items = cJSON_AddArrayToObject(root, "items");
+-
++/* {"items":[{ch,v,s,q,ts,stable}], "bid", "seq"} theo node_api.py's
++ * /node/v1/measurements. "s" (string reading) khong co tuong duong tren
++ * ESP32 (moi kenh deu la so) nen luon di ra null, giong node_agent.
++ *
++ * Dung chuoi bang snprintf vao bo dem TINH, khong dung cay cJSON nua.
++ *
++ * Vi sao doi: mot cay cJSON cho 50 ban ghi la ~350 nut x ~64 byte = ~22 KB
++ * NHAT THOI, cong chuoi in ra, cong bo dem cua cJSON_Print tu nhan doi khi
++ * day. Heap trong cua node nay chi 48 KB (PSRAM co chu dich khong bat, xem
++ * sdkconfig.defaults). Do duoc 19/09 khi them duong MQTT chay song song —
++ * hai cay cJSON cung luc: min_heap tut con 448 byte, http_post_json khong
++ * cap phat noi bo dem, `sent` dung o 0 va spool day cung 2048.
++ *
++ * Tra ve so ban ghi DA VIET DUOC — co the it hon n neu bo dem day. Nguoi
++ * goi PHAI ack theo con so nay, khong phai theo n.
++ */
++static char s_body[BODY_BYTES];
++
++static size_t build_measurements_body(const measurement_t *batch, size_t n,
++                                      size_t *out_len)
++{
++    int w = snprintf(s_body, sizeof(s_body),
++                     "{\"bid\":%u,\"seq\":%" PRIu32 ",\"items\":[",
++                     (unsigned)batch[n - 1].boot_id, batch[n - 1].seq);
++    if (w < 0 || (size_t)w >= sizeof(s_body)) {
++        return 0;
++    }
++    size_t len = (size_t)w;
++    size_t done = 0, written = 0;
+     int64_t offset = net_mgr_time_offset_ms();
++
+     for (size_t i = 0; i < n; i++) {
+         const measurement_t *m = &batch[i];
+         const cfg_channel_t *ch = cfg_channel_by_id(m->channel_id);
+         if (ch == NULL) {
++            /* kenh da bi go khoi bang: bo qua nhung VAN tinh la da xu ly,
++             * neu khong no ket lai dau spool mai mai */
++            done++;
+             continue;
+         }
+         int64_t ts = m->ts_ms;
+         if (ts < EPOCH_SANE_MS) {
+             ts += offset; /* recorded before first SNTP sync */
+         }
+-        cJSON *it = cJSON_CreateObject();
+-        cJSON_AddStringToObject(it, "ch", ch->code);
+-        cJSON_AddNumberToObject(it, "v", m->value);
+-        cJSON_AddNullToObject(it, "s");
+-        cJSON_AddNumberToObject(it, "q", m->quality);
+-        cJSON_AddNumberToObject(it, "ts", (double)ts);
+-        cJSON_AddBoolToObject(it, "stable", m->quality != Q_UNSTABLE);
+-        cJSON_AddItemToArray(items, it);
++        int k2 = snprintf(s_body + len, sizeof(s_body) - len,
++                          "%s{\"ch\":\"%s\",\"v\":%.4f,\"s\":null,\"q\":%u,"
++                          "\"ts\":%lld,\"stable\":%s}",
++                          written ? "," : "", ch->code,
++                          (double)m->value, (unsigned)m->quality,
++                          (long long)ts,
++                          m->quality != Q_UNSTABLE ? "true" : "false");
++        if (k2 < 0 || (size_t)k2 >= sizeof(s_body) - len) {
++            break;      /* day bo dem: gui phan da co, phan con lai o lai
++                         * spool va di trong lo sau */
++        }
++        len += (size_t)k2;
++        written++;
++        done++;
++    }
++    if (done == 0) {
++        return 0;
++    }
++    int k3 = snprintf(s_body + len, sizeof(s_body) - len, "]}");
++    if (k3 < 0 || (size_t)k3 >= sizeof(s_body) - len) {
++        return 0;
+     }
+-    char *body = cJSON_PrintUnformatted(root);
+-    cJSON_Delete(root);
+-    return body;
++    *out_len = len + (size_t)k3;
++    return done;
+ }
+ 
++
+ /* returns true when the batch was consumed (acked or deliberately dropped) */
+ static bool upload_batch(const measurement_t *batch, size_t n)
+ {
+-    char *body = build_measurements_body(batch, n);
+-    if (body == NULL) {
++    size_t body_len = 0;
++    size_t done = build_measurements_body(batch, n, &body_len);
++    if (done == 0) {
+         return false;
+     }
+-    int status = http_post_json(PATH_MEASUREMENTS, body, true);
+-    cJSON_free(body);
++    int status = http_post_json(PATH_MEASUREMENTS, s_body, true);
+ 
+-    uint16_t last_bid = batch[n - 1].boot_id;
+-    uint32_t last_seq = batch[n - 1].seq;
++    /* Ack theo `done`, KHONG theo n: bo dem tinh co the chi chua duoc mot
++     * phan lo. Ack qua ca lo se xoa nhung ban ghi chua he roi khoi node. */
++    uint16_t last_bid = batch[done - 1].boot_id;
++    uint32_t last_seq = batch[done - 1].seq;
+ 
+     if (status == 200) {
+         /* node_measurements() replies {"ok":true,"accepted":n} only — no
+@@ -249,14 +286,14 @@
+          * heartbeat-only under this contract). A 200 means the whole batch
+          * was accepted, so ack through the batch's own last record. */
+         spool_ack_through(last_bid, last_seq);
+-        __atomic_add_fetch(&s_sent_total, (uint32_t)n, __ATOMIC_RELAXED);
++        __atomic_add_fetch(&s_sent_total, (uint32_t)done, __ATOMIC_RELAXED);
+         s_last_ok_us = esp_timer_get_time();
+         return true;
+     }
+     if (status == 400) {
+         /* malformed by server's judgement: never retry-loop a poison batch */
+         ESP_LOGE(TAG, "server rejected batch (400), dropping %u samples: %s",
+-                 (unsigned)n, s_resp);
++                 (unsigned)done, s_resp);
+         spool_ack_through(last_bid, last_seq);
+         return true;
+     }
+@@ -493,32 +530,6 @@
+  * gpio_out.c): cmd="write" ghi muc 0/1 that ra chan do. Moi kenh/lenh khac
+  * (measure/serial/mbrtu/... hoac cmd != write) van bi tu choi co chu dich —
+  * chua co executor, khong gia vo thanh cong. */
+-static bool execute_command(const char *ch_code, const char *op, const cJSON *value,
+-                            char *detail, size_t detail_sz)
+-{
+-    const cfg_channel_t *ch = cfg_channel_by_code(ch_code);
+-    if (ch == NULL) {
+-        snprintf(detail, detail_sz, "khong biet kenh '%s'", ch_code[0] ? ch_code : "?");
+-        return false;
+-    }
+-    if (ch->bus != BUS_GPIO || ch->io_mode != IO_OUTPUT) {
+-        snprintf(detail, detail_sz, "kenh '%s' khong phai GPIO output — "
+-                 "firmware nay chua ho tro dieu khien tu xa cho no", ch_code);
+-        return false;
+-    }
+-    if (strcmp(op, "write") != 0) {
+-        snprintf(detail, detail_sz, "kenh GPIO output chi ho tro cmd=write");
+-        return false;
+-    }
+-    int level = (value != NULL && cJSON_IsNumber(value)) ? (value->valuedouble != 0) : 0;
+-    if (!gpio_out_write(ch, level)) {
+-        snprintf(detail, detail_sz, "ghi GPIO that bai");
+-        return false;
+-    }
+-    detail[0] = '\0';
+-    return true;
+-}
+-
+ /* GET /node/v1/commands -> {"command":{"id","channel","cmd","value"}} |
+  * {"command":null}. Ket qua thuc thi (xem execute_command() o tren) duoc
+  * ACK ve /node/v1/commands/ack de tra loi lai cho Odoo's
+@@ -547,7 +558,10 @@
+         const char *op_str  = cJSON_IsString(op) ? op->valuestring : "";
+ 
+         char detail[64];
+-        bool ok = execute_command(ch_code, op_str, value, detail, sizeof(detail));
++        bool ok = gpio_out_execute_command(
++            ch_code, op_str, cJSON_IsNumber(value),
++            cJSON_IsNumber(value) ? value->valuedouble : 0.0,
++            detail, sizeof(detail));
+         if (ok) {
+             ESP_LOGI(TAG, "lenh '%s' tren kenh '%s' thuc thi OK", op_str, ch_code);
+         } else {
+--- a/components/gpio_out/gpio_out.h
++++ b/components/gpio_out/gpio_out.h
+@@ -33,6 +33,17 @@
+  * cau hinh (sai bus/io_mode, hoac chua goi gpio_out_start()). */
+ bool gpio_out_write(const cfg_channel_t *ch, int level);
+ 
++/* Thuc thi mot lenh thiet bi tu server: tra cuu kenh, kiem tra no la GPIO
++ * output, roi ghi muc 0/1. `detail` nhan ly do khi tra false.
++ *
++ * De o DAY chu khong o uplink.c vi tu 19/09 co HAI duong mang lenh toi:
++ * uplink (/node/v1/commands) va mqtt_link (fms/<serial>/cmd). Dat o mot
++ * trong hai se buoc ben kia phu thuoc nguoc — va hai ban sao cua cung mot
++ * logic kiem tra la cach chac chan nhat de chung lech nhau. */
++bool gpio_out_execute_command(const char *ch_code, const char *op,
++                              bool has_value, double value,
++                              char *detail, size_t detail_sz);
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/components/gpio_out/gpio_out.c
++++ b/components/gpio_out/gpio_out.c
+@@ -4,6 +4,9 @@
+ #include "esp_log.h"
+ 
+ #include "cfg.h"
++#include <stdio.h>
++#include <string.h>
++
+ #include "gpio_out.h"
+ #include "meas_core.h"
+ 
+@@ -73,3 +76,31 @@
+     meas_push(ch->id, SRC_GPIO, Q_GOOD, (float)on);
+     return true;
+ }
++
++bool gpio_out_execute_command(const char *ch_code, const char *op,
++                              bool has_value, double value,
++                              char *detail, size_t detail_sz)
++{
++    const cfg_channel_t *ch = cfg_channel_by_code(ch_code);
++    if (ch == NULL) {
++        snprintf(detail, detail_sz, "khong biet kenh '%s'",
++                 (ch_code && ch_code[0]) ? ch_code : "?");
++        return false;
++    }
++    if (ch->bus != BUS_GPIO || ch->io_mode != IO_OUTPUT) {
++        snprintf(detail, detail_sz, "kenh '%s' khong phai GPIO output — "
++                 "firmware nay chua ho tro dieu khien tu xa cho no", ch_code);
++        return false;
++    }
++    if (op == NULL || strcmp(op, "write") != 0) {
++        snprintf(detail, detail_sz, "kenh GPIO output chi ho tro cmd=write");
++        return false;
++    }
++    int level = has_value ? (value != 0) : 0;
++    if (!gpio_out_write(ch, level)) {
++        snprintf(detail, detail_sz, "ghi GPIO that bai");
++        return false;
++    }
++    detail[0] = '\0';
++    return true;
++}

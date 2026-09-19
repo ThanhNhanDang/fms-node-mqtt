@@ -40,6 +40,11 @@ uint32_t mqtt_link_published(void);
  * du. Con so nay noi cho ta biet MQTT co theo kip khong. */
 uint32_t mqtt_link_dropped(void);
 
+/* So ban ghi bi bao-khi-doi nen lai (gia tri khong doi, chua toi han nhac
+ * lai). Con so nay cho biet RBE dang tiet kiem bao nhieu — do 18/09 thi
+ * count1/pedal1/count2 chiem 75% luu luong chi de noi "van la 0". */
+uint32_t mqtt_link_suppressed(void);
+
 bool mqtt_link_connected(void);
 
 #ifdef __cplusplus
