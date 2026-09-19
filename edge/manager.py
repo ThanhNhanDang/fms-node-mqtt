@@ -187,7 +187,19 @@ class SourceManager:
         # chu khong dua tren cau hinh ben nay: firmware cu khong biet nghe
         # MQTT van phai duoc phuc vu bang hang doi, va no tu noi dieu do.
         mq = getattr(self, "mqtt_cmd", None)
-        if not (mq is not None and mq.publish_command(serial, payload)):
+        if mq is not None and mq.publish_command(serial, payload):
+            pass
+        elif mq is not None and mq.caps.get(serial):
+            # Firmware nay noi MQTT nhung gui khong duoc (node rot, hoac mat
+            # broker). KHONG duoc xep vao hang doi poll: firmware da tat HTTP
+            # nen khong con ai goi /node/v1/commands de lay ra — lenh se nam
+            # do mai mai, vua ro ri bo nho vua bao sai nguyen nhan cho nguoi
+            # bam nut. Bao that luon.
+            self._node_futures.pop(cmd_id, None)
+            return {"ok": False,
+                    "error": "node %s dang khong ket noi broker" % serial}
+        else:
+            # Firmware cu, van tu poll /node/v1/commands.
             self._node_queues.setdefault(serial, asyncio.Queue()).put_nowait(payload)
         try:
             return await asyncio.wait_for(fut, timeout=timeout)

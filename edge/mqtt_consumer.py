@@ -214,10 +214,15 @@ class MqttConsumer:
         if kind == "status":
             online = bool(data.get("online"))
             self.stats["online"][serial] = online
-            # Node tu khai co nhan duoc lenh qua MQTT khong. Mat ket noi thi
-            # xoa loi khai di — lenh quay ve hang doi poll thay vi bay vao
-            # hu khong.
-            self.caps[serial] = online and bool(data.get("cmd"))
+            # Node tu khai co nhan duoc lenh qua MQTT khong.
+            #
+            # KHONG xoa loi khai nay khi node rot mang: biet nghe MQTT la
+            # thuoc tinh cua FIRMWARE, con song hay chet la chuyen khac.
+            # Gop hai thu lam mot thi luc node rot, manager tuong day la
+            # firmware cu va xep lenh vao hang doi poll — ma firmware moi
+            # khong bao gio poll nua.
+            if online and data.get("cmd"):
+                self.caps[serial] = True
             _logger.info("node %s: %s%s", serial,
                          "online" if online else "OFFLINE (Last Will)",
                          ", nhan lenh qua MQTT" if self.caps.get(serial) else "")
@@ -319,6 +324,11 @@ class MqttConsumer:
             return False
         if not self.caps.get(serial):
             return False        # node chua khai la nhan duoc lenh qua MQTT
+        if not self.stats["online"].get(serial):
+            # Chu de lenh khong retain va node khong dung phien ben, nen goi
+            # gui cho mot node vang mat bi broker vut di. Tra False de ben
+            # goi bao loi that, thay vi bao "da gui" roi im lang.
+            return False
         topic = _cmd_topic(serial)
         if topic is None:
             return False
