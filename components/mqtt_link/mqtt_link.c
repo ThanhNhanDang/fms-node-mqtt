@@ -13,6 +13,7 @@
 #include "mqtt_client.h"
 
 #include "cfg.h"
+#include "heapwatch.h"
 #include "meas_core.h"
 #include "mqtt_link.h"
 #include "net_mgr.h"
@@ -212,6 +213,7 @@ static void on_mqtt_event(void *handler_args, esp_event_base_t base,
         esp_mqtt_client_publish(s_cli, s_topic_status,
                                 "{\"online\":true}", 0, 1, 1);
         ESP_LOGI(TAG, "da noi broker");
+        heap_mark("mqtt CONNECTED");
         break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -269,7 +271,9 @@ static void link_task(void *arg)
         return;
     }
     esp_mqtt_client_register_event(s_cli, ESP_EVENT_ANY_ID, on_mqtt_event, NULL);
+    heap_mark("truoc mqtt start");
     esp_mqtt_client_start(s_cli);
+    heap_mark("sau mqtt start");
 
     measurement_t *batch = calloc(CONFIG_MQTT_LINK_BATCH_MAX,
                                   sizeof(measurement_t));
@@ -324,6 +328,7 @@ static void link_task(void *arg)
          * PUBACK. enqueue() bo goi vao hang cua tac vu mang roi tra ve
          * ngay; QoS 1 va PUBACK van nguyen. esp-mqtt CHEP payload vao
          * outbox cua no, nen dung bo dem tinh o day la an toan. */
+        heap_mark("truoc enqueue");
         int msg_id = esp_mqtt_client_enqueue(s_cli, s_topic_meas, s_body,
                                              (int)body_len, 1, 0, true);
         if (msg_id < 0) {

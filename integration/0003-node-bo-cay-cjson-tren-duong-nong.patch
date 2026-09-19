@@ -1,5 +1,21 @@
 --- a/components/uplink/uplink.c
 +++ b/components/uplink/uplink.c
+@@ -2,7 +2,6 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-
+ #include "freertos/FreeRTOS.h"
+ #include "freertos/task.h"
+ #include "cJSON.h"
+@@ -18,6 +17,7 @@
+ 
+ #include "ble_print.h"
+ #include "cfg.h"
++#include "heapwatch.h"
+ #include "gpio_out.h"
+ #include "meas_core.h"
+ #include "net_mgr.h"
 @@ -41,6 +41,10 @@
   * node thu lai trong <=30s (khong cho 5 phut nhu remote link). */
  #define BACKOFF_MAX_MS   30000
@@ -11,7 +27,42 @@
  #define CFG_JSON_MAX     16384           /* matches cfg.c CHJSON_MAX */
  #define CFG_RETRY_US     (5LL * 60 * 1000000)  /* min gap between fetches */
  #define CFG_DRAIN_BATCHES 20             /* spool flush cap before restart */
-@@ -190,58 +194,91 @@
+@@ -156,6 +160,7 @@
+ {
+     char url[192];
+     snprintf(url, sizeof(url), "%s%s", cfg_get_server_url(), path);
++    const bool is_https = (strncmp(url, "https://", 8) == 0);
+ 
+     s_resp_len = 0;
+     s_resp[0]  = '\0';
+@@ -166,10 +171,22 @@
+         .timeout_ms    = HTTP_TIMEOUT_MS,
+         .event_handler = http_evt,
+         .keep_alive_enable = true,
+-        /* only consulted for https:// URLs (esp_http_client no-ops it for
+-         * plain http://) — validates against the bundled public CA store,
+-         * so server_url can be either scheme without a build-time switch */
+-        .crt_bundle_attach = esp_crt_bundle_attach,
++        /* Gan kho CA CHI KHI url that su la https.
++         *
++         * Chu thich cu noi bundle "chi duoc dung cho https, esp_http_client
++         * bo qua voi http thuan". Dung ve SU DUNG, sai ve CAP PHAT: dat
++         * truong nay khien esp_http_client_init() dung ca bo may TLS kem
++         * kho chung chi, roi cleanup() vut di — MOI LAN POST.
++         *
++         * Do duoc 19/09 bang heapwatch: heap trong 24,2 KB truoc POST, tut
++         * con 2,7 KB trong luc POST — ~21,5 KB nhat thoi, ~20 lan/giay, va
++         * la nguon phan mang lam day heap tut dan (10024 -> 7520 -> 5724
++         * -> 2700 B trong 6 phut). Edge chay http:// thuan tren LAN nen toan
++         * bo cho do la vo ich.
++         *
++         * Van giu duoc ca hai lua chon: doi server_url sang https thi bundle
++         * tu gan lai, khong can dung lai firmware. */
++        .crt_bundle_attach = is_https ? esp_crt_bundle_attach : NULL,
+     };
+     esp_http_client_handle_t cl = esp_http_client_init(&cc);
+     if (cl == NULL) {
+@@ -190,58 +207,93 @@
      return status;
  }
  
@@ -124,10 +175,13 @@
      }
 -    int status = http_post_json(PATH_MEASUREMENTS, body, true);
 -    cJSON_free(body);
-+    int status = http_post_json(PATH_MEASUREMENTS, s_body, true);
- 
+-
 -    uint16_t last_bid = batch[n - 1].boot_id;
 -    uint32_t last_seq = batch[n - 1].seq;
++    heap_mark("truoc POST measurements");
++    int status = http_post_json(PATH_MEASUREMENTS, s_body, true);
++    heap_mark("sau POST measurements");
++
 +    /* Ack theo `done`, KHONG theo n: bo dem tinh co the chi chua duoc mot
 +     * phan lo. Ack qua ca lo se xoa nhung ban ghi chua he roi khoi node. */
 +    uint16_t last_bid = batch[done - 1].boot_id;
@@ -135,7 +189,7 @@
  
      if (status == 200) {
          /* node_measurements() replies {"ok":true,"accepted":n} only — no
-@@ -249,14 +286,14 @@
+@@ -249,14 +301,14 @@
           * heartbeat-only under this contract). A 200 means the whole batch
           * was accepted, so ack through the batch's own last record. */
          spool_ack_through(last_bid, last_seq);
@@ -152,7 +206,44 @@
          spool_ack_through(last_bid, last_seq);
          return true;
      }
-@@ -493,32 +530,6 @@
+@@ -299,7 +351,9 @@
+     char *body = cJSON_PrintUnformatted(root);
+     cJSON_Delete(root);
+     if (body != NULL) {
+-        int status = http_post_json(PATH_HEARTBEAT, body, true);
++        heap_mark("truoc heartbeat");
++    int status = http_post_json(PATH_HEARTBEAT, body, true);
++    heap_mark("sau heartbeat");
+         cJSON_free(body);
+         if (status == 200) {
+             s_last_ok_us = esp_timer_get_time();
+@@ -330,7 +384,9 @@
+     if (body == NULL) {
+         return;
+     }
++    heap_mark("truoc hello");
+     int status = http_post_json(PATH_HELLO, body, false);
++    heap_mark("sau hello");
+     cJSON_free(body);
+     if (status != 200) {
+         ESP_LOGI(TAG, "hello status %d", status);
+@@ -361,12 +417,14 @@
+ {
+     char url[192];
+     snprintf(url, sizeof(url), "%s%s", cfg_get_server_url(), path);
++    const bool is_https = (strncmp(url, "https://", 8) == 0);
+ 
+     esp_http_client_config_t cc = {
+         .url        = url,
+         .method     = HTTP_METHOD_GET,
+         .timeout_ms = HTTP_TIMEOUT_MS,
+-        .crt_bundle_attach = esp_crt_bundle_attach,
++        /* xem ghi chu trong http_post_json: gan kho CA khi va chi khi https */
++        .crt_bundle_attach = is_https ? esp_crt_bundle_attach : NULL,
+     };
+     esp_http_client_handle_t cl = esp_http_client_init(&cc);
+     if (cl == NULL) {
+@@ -493,32 +551,6 @@
   * gpio_out.c): cmd="write" ghi muc 0/1 that ra chan do. Moi kenh/lenh khac
   * (measure/serial/mbrtu/... hoac cmd != write) van bi tu choi co chu dich —
   * chua co executor, khong gia vo thanh cong. */
@@ -185,7 +276,7 @@
  /* GET /node/v1/commands -> {"command":{"id","channel","cmd","value"}} |
   * {"command":null}. Ket qua thuc thi (xem execute_command() o tren) duoc
   * ACK ve /node/v1/commands/ack de tra loi lai cho Odoo's
-@@ -547,7 +558,10 @@
+@@ -547,7 +579,10 @@
          const char *op_str  = cJSON_IsString(op) ? op->valuestring : "";
  
          char detail[64];
@@ -197,6 +288,25 @@
          if (ok) {
              ESP_LOGI(TAG, "lenh '%s' tren kenh '%s' thuc thi OK", op_str, ch_code);
          } else {
+@@ -743,7 +778,9 @@
+          * carries real physical wiring fields end to end. */
+ 
+         if (esp_timer_get_time() >= next_cmd_us) {
++            heap_mark("truoc poll_command");
+             poll_command();
++            heap_mark("sau poll_command");
+             next_cmd_us = esp_timer_get_time() + cmd_period_us;
+         }
+ 
+--- a/components/uplink/CMakeLists.txt
++++ b/components/uplink/CMakeLists.txt
+@@ -1,5 +1,5 @@
+ idf_component_register(SRCS "uplink.c"
+                        INCLUDE_DIRS "."
+-                       PRIV_REQUIRES esp_http_client espressif__cjson cfg meas_core
++                       PRIV_REQUIRES esp_http_client espressif__cjson cfg meas_core heapwatch
+                                      spooler net_mgr esp_timer ble_print mbedtls
+                                      gpio_out)
 --- a/components/gpio_out/gpio_out.h
 +++ b/components/gpio_out/gpio_out.h
 @@ -33,6 +33,17 @@
@@ -261,3 +371,218 @@
 +    detail[0] = '\0';
 +    return true;
 +}
+--- a/main/main.c
++++ b/main/main.c
+@@ -1,94 +1,106 @@
+-/* FMS Node entry point.
+- *
+- * Demo scope: WiFi STA + Modbus TCP polling + serial scale + HTTP uplink
+- * with RAM spool (survives WiFi loss, NOT reboot).
+- *
+- * Intentionally NOT in this demo (upgrade path):
+- *  - OTA:       add otadata/ota_0/ota_1 partitions + esp_https_ota
+- *  - LittleFS:  swap spooler ring internals for a flash segment spool
+- *  - BLE/CAN:   not needed for demo hardware
+- *  - RS485 RTU: swap mb_tcp for espressif/esp-modbus
+- */
+-#include <inttypes.h>
+-
+-#include "freertos/FreeRTOS.h"
+-#include "freertos/task.h"
+-#include "esp_log.h"
+-#include "esp_system.h"
+-#include "esp_task_wdt.h"
+-#include "nvs_flash.h"
+-
+-#include "ble_central.h"
+-#include "ble_print.h"
+-#include "ble_uart.h"
+-#include "cfg.h"
+-#include "gpio_out.h"
+-#include "i2c_sens.h"
+-#include "io_scan.h"
+-#include "meas_core.h"
+-#include "prov_portal.h"
+-#include "net_mgr.h"
+-#include "mb_rtu.h"
+-#include "mb_tcp.h"
+-#include "scale_serial.h"
+-#include "spooler.h"
+-#include "tower_light.h"
+-#include "uplink.h"
+-
+-static const char *TAG = "main";
+-
+-void app_main(void)
+-{
+-    /* NVS is required by cfg (boot counter, creds) and by WiFi */
+-    esp_err_t err = nvs_flash_init();
+-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+-        ESP_ERROR_CHECK(nvs_flash_erase());
+-        err = nvs_flash_init();
+-    }
+-    ESP_ERROR_CHECK(err);
+-
+-    ESP_ERROR_CHECK(cfg_init());
+-
+-    /* Fresh node or BOOT button held -> maintenance-only SoftAP portal
+-     * (FMS-NODE-xxxx). Saves credentials to NVS then reboots; no
+-     * acquisition runs in this mode. */
+-    if (cfg_take_provisioning_request()) {
+-        prov_portal_run(); /* never returns */
+-    }
+-
+-    ESP_ERROR_CHECK(meas_core_init());
+-    ESP_ERROR_CHECK(net_mgr_start());
+-    ESP_ERROR_CHECK(spooler_init());
+-    ESP_ERROR_CHECK(mb_tcp_start());
+-    ESP_ERROR_CHECK(mb_rtu_start());  /* onboard RS485: sensors + tower relay */
+-    ESP_ERROR_CHECK(i2c_sens_start());
+-    ESP_ERROR_CHECK(io_scan_start());
+-    ESP_ERROR_CHECK(gpio_out_start()); /* relay/lamp outputs, server-commanded */
+-    ESP_ERROR_CHECK(scale_serial_start());
+-    ESP_ERROR_CHECK(uplink_start());
+-    ESP_ERROR_CHECK(ble_uart_start());   /* live JSON feed for the B4A app */
+-    ESP_ERROR_CHECK(ble_central_start()); /* BLE instruments (caliper...) */
+-    ESP_ERROR_CHECK(ble_print_init());   /* pool may in BLE (noi thuong truc) */
+-    ESP_ERROR_CHECK(tower_light_start()); /* Qisen tower via relay module */
+-    ESP_ERROR_CHECK(prov_button_watch_start()); /* BOOT 5 s -> portal */
+-    ESP_ERROR_CHECK(prov_portal_start_runtime()); /* http://<node-ip>/ */
+-
+-    ESP_LOGI(TAG, "fms-node up: serial=%s boot_id=%u fw=0.1.0",
+-             cfg_node_serial(), (unsigned)cfg_boot_id());
+-
+-    /* main task doubles as the 10 s status reporter */
+-    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
+-    while (1) {
+-        vTaskDelay(pdMS_TO_TICKS(10000));
+-        esp_task_wdt_reset();
+-        ESP_LOGI(TAG,
+-                 "status: heap=%" PRIu32 " min_heap=%" PRIu32
+-                 " rssi=%d spool=%u sent=%" PRIu32 " drop=%" PRIu32,
+-                 esp_get_free_heap_size(),
+-                 esp_get_minimum_free_heap_size(),
+-                 net_mgr_rssi(),
+-                 (unsigned)spool_depth(),
+-                 uplink_sent_total(),
+-                 meas_dropped_count());
+-    }
+-}
++/* FMS Node entry point.
++ *
++ * Demo scope: WiFi STA + Modbus TCP polling + serial scale + HTTP uplink
++ * with RAM spool (survives WiFi loss, NOT reboot).
++ *
++ * Intentionally NOT in this demo (upgrade path):
++ *  - OTA:       add otadata/ota_0/ota_1 partitions + esp_https_ota
++ *  - LittleFS:  swap spooler ring internals for a flash segment spool
++ *  - BLE/CAN:   not needed for demo hardware
++ *  - RS485 RTU: swap mb_tcp for espressif/esp-modbus
++ */
++#include <inttypes.h>
++
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "esp_log.h"
++#include "esp_system.h"
++#include "esp_task_wdt.h"
++#include "nvs_flash.h"
++
++#include "ble_central.h"
++#include "ble_print.h"
++#include "ble_uart.h"
++#include "cfg.h"
++#include "heapwatch.h"
++#include "gpio_out.h"
++#include "i2c_sens.h"
++#include "io_scan.h"
++#include "meas_core.h"
++#include "prov_portal.h"
++#include "net_mgr.h"
++#include "mb_rtu.h"
++#include "mb_tcp.h"
++#include "mqtt_link.h"
++#include "scale_serial.h"
++#include "spooler.h"
++#include "tower_light.h"
++#include "uplink.h"
++
++static const char *TAG = "main";
++
++void app_main(void)
++{
++    /* NVS is required by cfg (boot counter, creds) and by WiFi */
++    esp_err_t err = nvs_flash_init();
++    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
++        ESP_ERROR_CHECK(nvs_flash_erase());
++        err = nvs_flash_init();
++    }
++    ESP_ERROR_CHECK(err);
++
++    ESP_ERROR_CHECK(cfg_init());
++
++    /* Fresh node or BOOT button held -> maintenance-only SoftAP portal
++     * (FMS-NODE-xxxx). Saves credentials to NVS then reboots; no
++     * acquisition runs in this mode. */
++    if (cfg_take_provisioning_request()) {
++        prov_portal_run(); /* never returns */
++    }
++
++    ESP_ERROR_CHECK(meas_core_init());
++    ESP_ERROR_CHECK(net_mgr_start());
++    heap_mark("sau net_mgr_start");
++    ESP_ERROR_CHECK(spooler_init());
++    heap_mark("sau spooler_init");
++    ESP_ERROR_CHECK(mb_tcp_start());
++    heap_mark("sau mb_tcp_start");
++    ESP_ERROR_CHECK(mb_rtu_start());  /* onboard RS485: sensors + tower relay */
++    heap_mark("sau mb_rtu_start");
++    ESP_ERROR_CHECK(i2c_sens_start());
++    ESP_ERROR_CHECK(io_scan_start());
++    ESP_ERROR_CHECK(gpio_out_start()); /* relay/lamp outputs, server-commanded */
++    ESP_ERROR_CHECK(scale_serial_start());
++    ESP_ERROR_CHECK(uplink_start());
++    heap_mark("sau uplink_start");
++    ESP_ERROR_CHECK(mqtt_link_start()); /* phat song song, khong cat HTTP */
++    heap_mark("sau mqtt_link_start");
++    ESP_ERROR_CHECK(ble_uart_start());   /* live JSON feed for the B4A app */
++    heap_mark("sau ble_uart_start");
++    ESP_ERROR_CHECK(ble_central_start()); /* BLE instruments (caliper...) */
++    heap_mark("sau ble_central_start");
++    ESP_ERROR_CHECK(ble_print_init());   /* pool may in BLE (noi thuong truc) */
++    ESP_ERROR_CHECK(tower_light_start()); /* Qisen tower via relay module */
++    ESP_ERROR_CHECK(prov_button_watch_start()); /* BOOT 5 s -> portal */
++    ESP_ERROR_CHECK(prov_portal_start_runtime()); /* http://<node-ip>/ */
++    heap_mark("sau prov_portal_start_runtime");
++
++    ESP_LOGI(TAG, "fms-node up: serial=%s boot_id=%u fw=0.1.0",
++             cfg_node_serial(), (unsigned)cfg_boot_id());
++
++    /* main task doubles as the 10 s status reporter */
++    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
++    while (1) {
++        vTaskDelay(pdMS_TO_TICKS(10000));
++        esp_task_wdt_reset();
++        ESP_LOGI(TAG,
++                 "status: heap=%" PRIu32 " min_heap=%" PRIu32
++                 " rssi=%d spool=%u sent=%" PRIu32 " drop=%" PRIu32,
++                 esp_get_free_heap_size(),
++                 esp_get_minimum_free_heap_size(),
++                 net_mgr_rssi(),
++                 (unsigned)spool_depth(),
++                 uplink_sent_total(),
++                 meas_dropped_count());
++    }
++}
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ idf_component_register(SRCS "main.c"
+                        INCLUDE_DIRS "."
+-                       PRIV_REQUIRES nvs_flash esp_timer
++                       PRIV_REQUIRES nvs_flash esp_timer heapwatch
+                                      cfg meas_core net_mgr mb_tcp mb_rtu
+                                      i2c_sens io_scan gpio_out scale_serial
+-                                     spooler uplink ble_uart ble_central
++                                     spooler uplink mqtt_link ble_uart ble_central
+                                      ble_print prov_portal tower_light)
