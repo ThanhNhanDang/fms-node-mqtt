@@ -54,6 +54,7 @@ Day la ly do client_id PHAI co dinh va PHAI khac nhau giua cac tien trinh:
 hai ben dung chung mot client_id se da nhau ra khoi broker lien tuc.
 """
 import asyncio
+import collections
 import json
 import logging
 import time
@@ -75,6 +76,11 @@ HEARTBEAT_S = 30
 # Coi la dong ho chua dong bo neu truoc moc nay (2020-09). Bang dung nguong
 # EPOCH_SANE_MS cua firmware.
 EPOCH_SANE_S = 1600000000
+
+# So goi giu lai cho trang /ops. 300 la khoang 5 phut o nhip hien tai — du
+# de nhin thay mot lan bam nut di va ve, ma khong giu lich su trong RAM cua
+# mot tien trinh dang chay 24/7.
+TRAFFIC_MAX = 300
 
 
 class MqttConsumer:
@@ -100,8 +106,15 @@ class MqttConsumer:
         }
         # serial -> firmware co biet nhan lenh qua MQTT khong (co "cmd" trong
         # chu de status). Khong doan: node tu khai.
-        self._caps = {}
+        self.caps = {}
         self._hb_task = None
+        # Nhat ky goi tin cho trang /ops. Vong dem trong BO NHO, khong ghi
+        # dia: day la kinh luc, khong phai so sach. SQLite history moi la
+        # noi so lieu song.
+        self.traffic = collections.deque(maxlen=TRAFFIC_MAX)
+        self._ev_seq = 0
+        # code kenh den -> {"v": 0/1, "ts": ..., "serial": ...}
+        self.lamps = {}
 
     # -- vong doi ------------------------------------------------------
     async def start(self) -> None:
@@ -179,6 +192,12 @@ class MqttConsumer:
         except Exception as exc:                                  # noqa: BLE001
             _logger.warning("khong dang ky duoc %s: %s", topic, exc)
 
+    def _log_event(self, direction: str, topic: str, nbytes: int, note: str):
+        self._ev_seq += 1
+        self.traffic.append({"seq": self._ev_seq, "t": time.time(),
+                             "dir": direction, "topic": topic,
+                             "bytes": nbytes, "note": note[:160]})
+
     def _handle(self, topic: str, raw: bytes):
         serial, kind = _parse_topic(topic)
         if not serial:
@@ -198,10 +217,12 @@ class MqttConsumer:
             # Node tu khai co nhan duoc lenh qua MQTT khong. Mat ket noi thi
             # xoa loi khai di — lenh quay ve hang doi poll thay vi bay vao
             # hu khong.
-            self._caps[serial] = online and bool(data.get("cmd"))
+            self.caps[serial] = online and bool(data.get("cmd"))
             _logger.info("node %s: %s%s", serial,
                          "online" if online else "OFFLINE (Last Will)",
-                         ", nhan lenh qua MQTT" if self._caps.get(serial) else "")
+                         ", nhan lenh qua MQTT" if self.caps.get(serial) else "")
+            self._log_event("up", topic, len(raw),
+                            "online" if online else "OFFLINE (Last Will)")
             return
 
         if kind == "cmdack":
@@ -212,8 +233,12 @@ class MqttConsumer:
             self.stats["cmd_acked"] += 1
             # Dung cho tra loi ma /node/v1/commands/ack van dung: future cua
             # queue_command dang cho o day, khong co duong thu hai.
+            ok = bool(data.get("ok"))
+            self._log_event("up", topic, len(raw),
+                            "lenh #%s %s%s" % (cmd_id, "OK" if ok else "TU CHOI",
+                                               "" if ok else ": " + str(data.get("detail") or "")))
             self._agent.manager.node_ack_command(
-                cmd_id, bool(data.get("ok")), data.get("detail") or "")
+                cmd_id, ok, data.get("detail") or "")
             return
 
         items = data.get("items")
@@ -239,6 +264,7 @@ class MqttConsumer:
         self._agent.manager.touch_node(serial)
 
         n = 0
+        preview = []
         for it in items[:MAX_ITEMS]:
             if not isinstance(it, dict):
                 continue
@@ -259,12 +285,23 @@ class MqttConsumer:
             if ts_s is not None and ts_s < EPOCH_SANE_S:
                 ts_s = None
                 self.stats["ts_dropped"] += 1
+            v = it.get("v")
+            if len(preview) < 4:
+                preview.append("%s=%s" % (ch, v))
+            # Kenh den: giu rieng gia tri moi nhat cho trang /ops. Node chi
+            # bao khi co ai ghi (bao-khi-doi), nen "ts" o day la luc DOI
+            # gan nhat, khong phai luc do gan nhat.
+            if str(ch).startswith("relay"):
+                self.lamps[ch] = {"v": v, "ts": ts_s or time.time(),
+                                  "serial": serial}
             self._agent.push_node_reading(
-                serial, ch, it.get("v"), it.get("s"), int(it.get("q") or 0),
+                serial, ch, v, it.get("s"), int(it.get("q") or 0),
                 ts_s, it.get("stable"),
             )
             self.stats["forwarded"] += 1
 
+        self._log_event("up", topic, len(raw),
+                        "%d ban ghi: %s" % (n, ", ".join(preview)))
         self.stats["messages"] += 1
         self.stats["items"] += n
         self.stats["last_ts"] = time.time()
@@ -280,7 +317,7 @@ class MqttConsumer:
         lenh gui cho mot node vang mat, dung nhu ta muon."""
         if not (self._cli and self._connected):
             return False
-        if not self._caps.get(serial):
+        if not self.caps.get(serial):
             return False        # node chua khai la nhan duoc lenh qua MQTT
         topic = _cmd_topic(serial)
         if topic is None:
@@ -294,6 +331,9 @@ class MqttConsumer:
             _logger.warning("day lenh toi %s that bai rc=%s", topic, info.rc)
             return False
         self.stats["cmd_sent"] += 1
+        self._log_event("down", topic, len(json.dumps(payload)),
+                        "lenh #%s %s %s=%s" % (payload.get("id"), payload.get("cmd"),
+                                               payload.get("channel"), payload.get("value")))
         return True
 
     # -- nhip tim thay mat node ------------------------------------------
