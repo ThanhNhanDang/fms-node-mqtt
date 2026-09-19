@@ -227,7 +227,7 @@ class MqttConsumer:
                          "online" if online else "OFFLINE (Last Will)",
                          ", nhan lenh qua MQTT" if self.caps.get(serial) else "")
             self._log_event("up", topic, len(raw),
-                            "online" if online else "OFFLINE (Last Will)")
+                            "đang chạy" if online else "ĐÃ TẮT (Last Will)")
             return
 
         if kind == "cmdack":
@@ -240,7 +240,7 @@ class MqttConsumer:
             # queue_command dang cho o day, khong co duong thu hai.
             ok = bool(data.get("ok"))
             self._log_event("up", topic, len(raw),
-                            "lenh #%s %s%s" % (cmd_id, "OK" if ok else "TU CHOI",
+                            "lệnh #%s %s%s" % (cmd_id, "OK" if ok else "TỪ CHỐI",
                                                "" if ok else ": " + str(data.get("detail") or "")))
             self._agent.manager.node_ack_command(
                 cmd_id, ok, data.get("detail") or "")
@@ -306,7 +306,7 @@ class MqttConsumer:
             self.stats["forwarded"] += 1
 
         self._log_event("up", topic, len(raw),
-                        "%d ban ghi: %s" % (n, ", ".join(preview)))
+                        "%d bản ghi: %s" % (n, ", ".join(preview)))
         self.stats["messages"] += 1
         self.stats["items"] += n
         self.stats["last_ts"] = time.time()
@@ -342,7 +342,7 @@ class MqttConsumer:
             return False
         self.stats["cmd_sent"] += 1
         self._log_event("down", topic, len(json.dumps(payload)),
-                        "lenh #%s %s %s=%s" % (payload.get("id"), payload.get("cmd"),
+                        "lệnh #%s %s %s=%s" % (payload.get("id"), payload.get("cmd"),
                                                payload.get("channel"), payload.get("value")))
         return True
 

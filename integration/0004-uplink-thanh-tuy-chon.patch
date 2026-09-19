@@ -11,7 +11,7 @@ index d938063..9c18d5b 100644
 -                                     gpio_out)
 +                                     gpio_out mqtt_link)
 diff --git a/components/uplink/uplink.c b/components/uplink/uplink.c
-index 1392353..32073d1 100644
+index 1392353..e3ca51f 100644
 --- a/components/uplink/uplink.c
 +++ b/components/uplink/uplink.c
 @@ -1,3 +1,36 @@
@@ -89,7 +89,30 @@ index 1392353..32073d1 100644
      cJSON_free(body);
      if (status != 200) {
          ESP_LOGI(TAG, "hello status %d", status);
-@@ -821,9 +847,7 @@ static void uplink_task(void *arg)
+@@ -621,11 +647,18 @@ static void poll_command(void)
+         const char *ch_code = cJSON_IsString(ch) ? ch->valuestring : "";
+         const char *op_str  = cJSON_IsString(op) ? op->valuestring : "";
+ 
++        const cJSON *jms  = cJSON_GetObjectItemCaseSensitive(cmd, "ms");
++        const cJSON *jper = cJSON_GetObjectItemCaseSensitive(cmd, "period_ms");
++        const gpio_cmd_t gc = {
++            .channel   = ch_code,
++            .op        = op_str,
++            .has_value = cJSON_IsNumber(value),
++            .value     = cJSON_IsNumber(value) ? value->valuedouble : 0.0,
++            .ms        = cJSON_IsNumber(jms)  ? (int32_t)jms->valuedouble  : 0,
++            .period_ms = cJSON_IsNumber(jper) ? (int32_t)jper->valuedouble : 0,
++        };
+         char detail[64];
+-        bool ok = gpio_out_execute_command(
+-            ch_code, op_str, cJSON_IsNumber(value),
+-            cJSON_IsNumber(value) ? value->valuedouble : 0.0,
+-            detail, sizeof(detail));
++        bool ok = gpio_out_execute(&gc, detail, sizeof(detail));
+         if (ok) {
+             ESP_LOGI(TAG, "lenh '%s' tren kenh '%s' thuc thi OK", op_str, ch_code);
+         } else {
+@@ -821,9 +854,7 @@ static void uplink_task(void *arg)
           * carries real physical wiring fields end to end. */
  
          if (esp_timer_get_time() >= next_cmd_us) {
@@ -99,7 +122,7 @@ index 1392353..32073d1 100644
              next_cmd_us = esp_timer_get_time() + cmd_period_us;
          }
  
-@@ -882,3 +906,5 @@ void uplink_kick(void)
+@@ -882,3 +913,5 @@ void uplink_kick(void)
          xTaskNotifyGive(s_task);
      }
  }

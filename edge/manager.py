@@ -168,7 +168,8 @@ class SourceManager:
     def has_node_or_driver(self, serial: str, ch_code: str) -> bool:
         return (serial, ch_code) in self._route or serial in self._node_last_seen
 
-    async def queue_command(self, serial: str, ch: str, cmd: str, value, timeout: float = 8.0) -> dict:
+    async def queue_command(self, serial: str, ch: str, cmd: str, value,
+                            timeout: float = 8.0, extra: dict = None) -> dict:
         """Xep mot lenh cho NODE (khong co driver dieu khien duoc — vd http_node),
         cho node tu poll roi ack. Dung khi driver_for_channel() tra ve None."""
         self._node_cmd_seq += 1
@@ -176,6 +177,8 @@ class SourceManager:
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._node_futures[cmd_id] = fut
         payload = {"id": cmd_id, "channel": ch, "cmd": cmd, "value": value}
+        if extra:
+            payload.update(extra)
 
         # Duong MQTT truoc, hang doi poll lam du phong.
         #
@@ -197,7 +200,7 @@ class SourceManager:
             # bam nut. Bao that luon.
             self._node_futures.pop(cmd_id, None)
             return {"ok": False,
-                    "error": "node %s dang khong ket noi broker" % serial}
+                    "error": "node %s đang không kết nối tới broker" % serial}
         else:
             # Firmware cu, van tu poll /node/v1/commands.
             self._node_queues.setdefault(serial, asyncio.Queue()).put_nowait(payload)

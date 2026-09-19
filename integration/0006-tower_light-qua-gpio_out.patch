@@ -1,0 +1,46 @@
+diff --git a/components/tower_light/CMakeLists.txt b/components/tower_light/CMakeLists.txt
+index d7dfe07..a488b45 100644
+--- a/components/tower_light/CMakeLists.txt
++++ b/components/tower_light/CMakeLists.txt
+@@ -1,4 +1,4 @@
+ idf_component_register(SRCS "tower_light.c"
+                        INCLUDE_DIRS "."
+-                       PRIV_REQUIRES esp_driver_gpio esp_timer
++                       PRIV_REQUIRES gpio_out esp_driver_gpio esp_timer
+                                      cfg meas_core net_mgr uplink mb_rtu)
+diff --git a/components/tower_light/tower_light.c b/components/tower_light/tower_light.c
+index e59e6f9..44a9def 100644
+--- a/components/tower_light/tower_light.c
++++ b/components/tower_light/tower_light.c
+@@ -10,6 +10,7 @@
+ 
+ #include "cfg.h"
+ #include "meas_core.h"
++#include "gpio_out.h"
+ #include "mb_rtu.h"
+ #include "net_mgr.h"
+ #include "tower_light.h"
+@@ -30,8 +31,23 @@ static const gpio_num_t PINS[5] = {
+     CONFIG_FMS_TOWER_BZ_GPIO,
+ };
+ 
++/* Xin gpio_out ghi ho truoc.
++ *
++ * Bon trong nam chan nay TRUNG voi kenh relay cua Odoo (5/6/7/14), va ten
++ * hai ben xao nhau: GPIO 5 o day la "do" nhung Odoo goi la relay_yellow.
++ * Truoc 19/09/2026 ham nay ghi thang gpio_set_level(), va vong lap 10 giay
++ * ben duoi ep ghi lai — nen mot den bat qua Odoo tu tat trong vong 10 giay,
++ * am tham, khong de lai mot ban ghi nao. Do la loi "den sang mot luc roi
++ * tat" ma khong ai giai thich duoc.
++ *
++ * Gio gpio_out la chu so huu: no tu choi ta khi kenh dang do nguoi giu, va
++ * moi thay doi deu duoc bao len may chu. Chi chan khong thuoc kenh nao moi
++ * roi xuong duong ghi thang o duoi. */
+ static void write_pin(gpio_num_t pin, int on)
+ {
++    if (gpio_out_auto_write_pin((int)pin, on)) {
++        return;
++    }
+ #if CONFIG_FMS_TOWER_ACTIVE_LOW
+     gpio_set_level(pin, on ? 0 : 1); /* opto relay boards trigger LOW */
+ #else

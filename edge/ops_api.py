@@ -57,7 +57,7 @@ PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Den &amp; goi tin</title>
+<title>Đèn &amp; gói tin</title>
 <style>
   :root {
     --bg:#f6f6f7; --panel:#ffffff; --line:#e3e3e6; --ink:#1c1c1f;
@@ -121,31 +121,33 @@ PAGE = """<!DOCTYPE html>
 <body>
 <div class="wrap">
   <header>
-    <h1>Den &amp; goi tin</h1>
-    <span class="sub"><span class="dot" id="brokerDot"></span> <span id="brokerTxt">dang noi...</span></span>
+    <h1>Đèn &amp; gói tin</h1>
+    <span class="sub"><span class="dot" id="brokerDot"></span> <span id="brokerTxt">đang nối…</span></span>
     <span class="sub" id="nodeTxt"></span>
   </header>
 
   <div class="tabs" role="tablist">
-    <button role="tab" aria-selected="true"  onclick="tab('lamps')">4 den</button>
-    <button role="tab" aria-selected="false" onclick="tab('log')">Goi tin</button>
+    <button role="tab" aria-selected="true"  onclick="tab('lamps')">4 đèn</button>
+    <button role="tab" aria-selected="false" onclick="tab('log')">Gói tin</button>
   </div>
 
   <section id="tab-lamps">
     <div class="lamps" id="lamps"></div>
-    <p class="foot">Day la trang thai firmware BAO da ghi ra chan GPIO, khong phai
-       cam bien doc nguoc tu bong den. Khong co day phan hoi nao tu den ve node.</p>
+    <p class="foot">Đây là trạng thái firmware <b>báo</b> đã ghi ra chân GPIO,
+       không phải cảm biến đọc ngược từ bóng đèn — không có dây phản hồi nào
+       từ đèn về node.</p>
   </section>
 
   <section id="tab-log" class="hide">
     <div class="cards" id="cards"></div>
     <div class="logbox" style="margin-top:12px; max-height:60vh">
       <table>
-        <thead><tr><th>Luc</th><th>Chieu</th><th>Chu de</th><th>Byte</th><th>Noi dung</th></tr></thead>
+        <thead><tr><th>Lúc</th><th>Chiều</th><th>Chủ đề</th><th>Byte</th><th>Nội dung</th></tr></thead>
         <tbody id="log"></tbody>
       </table>
     </div>
-    <p class="foot">Moi goi MQTT di qua tien trinh nay, moi nhat truoc. Giu 300 goi gan nhat trong bo nho.</p>
+    <p class="foot">Mọi gói MQTT đi qua tiến trình này, mới nhất trước.
+       Giữ 300 gói gần nhất trong bộ nhớ.</p>
   </section>
 </div>
 
@@ -162,11 +164,11 @@ function tab(which) {
 }
 
 function ago(now, ts) {
-  if (!ts) return 'chua co so lieu';
+  if (!ts) return 'chưa có số liệu';
   var d = Math.max(0, now - ts);
-  if (d < 60) return d.toFixed(0) + ' giay truoc';
-  if (d < 3600) return (d / 60).toFixed(0) + ' phut truoc';
-  return (d / 3600).toFixed(1) + ' gio truoc';
+  if (d < 60) return d.toFixed(0) + ' giây trước';
+  if (d < 3600) return (d / 60).toFixed(0) + ' phút trước';
+  return (d / 3600).toFixed(1) + ' giờ trước';
 }
 
 function hhmmss(ts) {
@@ -188,8 +190,8 @@ function drawLamps(s) {
     if (codes.indexOf(c) < 0) codes.push(c);
   });
   if (!codes.length) {
-    box.innerHTML = '<p class="foot">Chua thay kenh den nao. Node chi bao trang ' +
-                    'thai khi co ai ghi vao — bam mot cai switch de no len tieng.</p>';
+    box.innerHTML = '<p class="foot">Chưa thấy kênh đèn nào. Node chỉ báo ' +
+                    'trạng thái khi có ai ghi vào — bấm một cái switch để nó lên tiếng.</p>';
     return;
   }
   box.innerHTML = codes.map(function (code) {
@@ -199,7 +201,7 @@ function drawLamps(s) {
         ';border-color:' + col + ';box-shadow:' + (on ? '0 0 16px ' + col : 'none') + '"></div>' +
       '<div class="name">' + code + '</div>' +
       '<div class="state" style="color:' + (on ? col : 'var(--muted)') + '">' +
-        (on ? 'SANG' : 'tat') + '</div>' +
+        (on ? 'SÁNG' : 'tắt') + '</div>' +
       '<div class="age">' + ago(s.now, L.ts) + '</div>' +
     '</div>';
   }).join('');
@@ -207,9 +209,9 @@ function drawLamps(s) {
 
 function drawCards(s) {
   var m = s.stats, c = [
-    ['Goi nhan', m.messages], ['Ban ghi', m.items], ['Day vao Odoo', m.forwarded],
-    ['Lenh gui', m.cmd_sent], ['Lenh ack', m.cmd_acked],
-    ['Goi hong', m.bad], ['Ts vo ly', m.ts_dropped], ['Outbox', s.outbox]
+    ['Gói nhận', m.messages], ['Bản ghi', m.items], ['Đẩy vào Odoo', m.forwarded],
+    ['Lệnh gửi', m.cmd_sent], ['Lệnh đã ack', m.cmd_acked],
+    ['Gói hỏng', m.bad], ['Mốc giờ vô lý', m.ts_dropped], ['Outbox', s.outbox]
   ];
   document.getElementById('cards').innerHTML = c.map(function (x) {
     return '<div class="card"><b>' + x[1] + '</b><span>' + x[0] + '</span></div>';
@@ -237,11 +239,11 @@ function poll() {
       var dot = document.getElementById('brokerDot');
       dot.style.background = s.stats.connected ? 'var(--up)' : 'var(--warn)';
       document.getElementById('brokerTxt').textContent =
-        s.stats.connected ? 'broker da noi' : 'MAT KET NOI BROKER';
+        s.stats.connected ? 'broker đã nối' : 'MẤT KẾT NỐI BROKER';
       var names = Object.keys(s.stats.online);
       document.getElementById('nodeTxt').textContent = names.map(function (n) {
-        return n + (s.stats.online[n] ? ' online' : ' OFFLINE') +
-               (s.caps[n] ? ' - nhan lenh qua MQTT' : '');
+        return n + (s.stats.online[n] ? ' đang chạy' : ' ĐÃ TẮT') +
+               (s.caps[n] ? ' · nhận lệnh qua MQTT' : '');
       }).join(' | ');
 
       if (s.events.length) {
@@ -253,7 +255,7 @@ function poll() {
     })
     .catch(function () {
       document.getElementById('brokerDot').style.background = 'var(--warn)';
-      document.getElementById('brokerTxt').textContent = 'khong goi duoc edge';
+      document.getElementById('brokerTxt').textContent = 'không gọi được edge';
     })
     .then(function () { setTimeout(poll, 1000); });
 }

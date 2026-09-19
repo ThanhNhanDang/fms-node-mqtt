@@ -92,7 +92,9 @@ void      mqtt_link_kick(void)      { }
 
 static const char *TAG = "mqttlink";
 
-static QueueHandle_t            s_q;         /* che do tap */
+#if !SPOOL_MODE
+static QueueHandle_t            s_q;         /* chi che do tap */
+#endif
 static QueueHandle_t            s_cmd_q;
 static TaskHandle_t             s_task;
 static esp_mqtt_client_handle_t s_cli;
@@ -323,14 +325,21 @@ static void handle_command(const char *json)
     const cJSON *ch    = cJSON_GetObjectItemCaseSensitive(r, "channel");
     const cJSON *op    = cJSON_GetObjectItemCaseSensitive(r, "cmd");
     const cJSON *value = cJSON_GetObjectItemCaseSensitive(r, "value");
+    const cJSON *jms   = cJSON_GetObjectItemCaseSensitive(r, "ms");
+    const cJSON *jper  = cJSON_GetObjectItemCaseSensitive(r, "period_ms");
     const char *ch_code = cJSON_IsString(ch) ? ch->valuestring : "";
     const char *op_str  = cJSON_IsString(op) ? op->valuestring : "";
 
+    const gpio_cmd_t gc = {
+        .channel   = ch_code,
+        .op        = op_str,
+        .has_value = cJSON_IsNumber(value),
+        .value     = cJSON_IsNumber(value) ? value->valuedouble : 0.0,
+        .ms        = cJSON_IsNumber(jms)  ? (int32_t)jms->valuedouble  : 0,
+        .period_ms = cJSON_IsNumber(jper) ? (int32_t)jper->valuedouble : 0,
+    };
     char detail[64];
-    bool ok = gpio_out_execute_command(
-        ch_code, op_str, cJSON_IsNumber(value),
-        cJSON_IsNumber(value) ? value->valuedouble : 0.0,
-        detail, sizeof(detail));
+    bool ok = gpio_out_execute(&gc, detail, sizeof(detail));
     if (ok) {
         s_last_id = id;
         ESP_LOGI(TAG, "lenh %ld [%s] tren kenh %s: OK", id, op_str, ch_code);
